@@ -17,6 +17,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { DatabaseSync } = require('node:sqlite');
+const { buildSystemPrompt, extractSql, execAiSql, parseChartContent, autoChart, detectChartIntent } = require('./ai-lib.js');
 
 /* ---------- 常量 ---------- */
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -78,7 +79,8 @@ CREATE TABLE IF NOT EXISTS sales (
   "change"            REAL,
   member_id           INTEGER,
   member_name         TEXT,
-  member_level        TEXT
+  member_level        TEXT,
+  cashier             TEXT
 );
 CREATE TABLE IF NOT EXISTS sale_items (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +108,16 @@ CREATE TABLE IF NOT EXISTS stock_moves (
   note       TEXT DEFAULT ''
 );
 `);
+
+/* 迁移：为历史数据库补充 sales.cashier 列 */
+try {
+  const cols = db.prepare('PRAGMA table_info(sales)').all().map(c => c.name);
+  if (!cols.includes('cashier')) db.exec('ALTER TABLE sales ADD COLUMN cashier TEXT');
+} catch (e) { console.warn('[迁移] sales.cashier 列添加失败：', e.message); }
+
+/* AI 查询使用的只读连接（双重安全：白名单 + 只读） */
+let dbRO = null;
+try { dbRO = new DatabaseSync(DB_FILE, { readOnly: true }); } catch (e) { dbRO = null; }
 
 /* ---------- 默认数据（首次启动自动写入示例） ---------- */
 function seedIfEmpty(){
@@ -145,13 +157,17 @@ function seedIfEmpty(){
 seedIfEmpty();
 
 /* ---------- 设置 ---------- */
-const SETTING_DEFAULTS = { shopName: '收银宝便利店', cashier: '收银员', pointsPerYuan: 1, pointsToYuan: 100, lowStock: 10 };
+const SETTING_DEFAULTS = {
+  shopName: '收银宝便利店', cashier: '收银员', pointsPerYuan: 1, pointsToYuan: 100, lowStock: 10,
+  aiProvider: 'demo', aiBaseUrl: 'https://api.deepseek.com', aiKey: '', aiModel: 'deepseek-chat'
+};
 function getSettings(){
   const out = { ...SETTING_DEFAULTS };
   for (const row of db.prepare('SELECT key, value FROM settings').all()) out[row.key] = row.value;
   out.pointsPerYuan = parseFloat(out.pointsPerYuan) || 0;
   out.pointsToYuan = parseInt(out.pointsToYuan, 10) || 100;
   out.lowStock = parseInt(out.lowStock, 10) || 10;
+  if (!out.aiProvider) out.aiProvider = 'demo';
   delete out.seq;
   return out;
 }
@@ -243,6 +259,10 @@ route('PUT', '/api/settings', async (req, res) => {
   setSetting('pointsPerYuan', num(b.pointsPerYuan, 1));
   setSetting('pointsToYuan', Math.max(1, parseInt(b.pointsToYuan, 10) || 100));
   setSetting('lowStock', Math.max(0, parseInt(b.lowStock, 10) || 10));
+  setSetting('aiProvider', String(b.aiProvider || 'demo'));
+  setSetting('aiBaseUrl', String(b.aiBaseUrl || 'https://api.deepseek.com'));
+  setSetting('aiKey', typeof b.aiKey === 'string' ? b.aiKey : (getSettings().aiKey || ''));   // 未传时保留原密钥
+  setSetting('aiModel', String(b.aiModel || 'deepseek-chat'));
   json(res, 200, getSettings());
 }, { desktopOnly: true });
 
@@ -367,9 +387,10 @@ route('DELETE', '/api/expenses/:id', async (req, res, p) => {
 route('POST', '/api/sales', async (req, res) => {
   const b = await readBody(req);
   if (!Array.isArray(b.items) || b.items.length === 0) return json(res, 400, { error: '购物车为空' });
-  let s, member, payMethod, cashReceived, change;
+  let s, member, payMethod, cashReceived, change, cashier;
   try {
     const settings = getSettings();
+    cashier = String(b.cashier || settings.cashier || '').trim();
     member = b.memberId ? db.prepare('SELECT * FROM members WHERE id = ?').get(parseInt(b.memberId, 10)) : null;
     s = calcSale(b.items, member, b.pointsUse, b.manualDiscount, settings);
     payMethod = String(b.payMethod || '微信');
@@ -389,12 +410,13 @@ route('POST', '/api/sales', async (req, res) => {
   try {
     const r = db.prepare(`INSERT INTO sales (no, time, subtotal, manual_rate, manual_discount_amt, vip_rate, vip_discount,
         points_used, points_value, points_earned, payable, pay_method, cash_received, "change",
-        member_id, member_name, member_level)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        member_id, member_name, member_level, cashier)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(no, time, s.subtotal, s.manualRate, s.manualDiscountAmt, s.vipRate, s.vipDiscount,
         s.pointsUsed, s.pointsValue, s.pointsEarned, s.payable, payMethod, cashReceived, change,
         member ? member.id : null, member ? member.name : null,
-        member ? (db.prepare('SELECT name FROM levels WHERE id = ?').get(member.level_id) || {}).name : null);
+        member ? (db.prepare('SELECT name FROM levels WHERE id = ?').get(member.level_id) || {}).name : null,
+        cashier);
     const saleId = Number(r.lastInsertRowid);
 
     const insItem = db.prepare('INSERT INTO sale_items (sale_id, product_id, name, category, price, cost, qty) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -612,6 +634,153 @@ route('GET', '/api/report', async (req, res, params, url) => {
     daily, topProducts, payMethods, expenseCats, expenseList: exps.slice(0, 30)
   });
 });
+
+/* --- AI 助手 --- */
+async function callLLM(settings, messages, jsonMode){
+  const base = String(settings.aiBaseUrl || 'https://api.deepseek.com').replace(/\/+$/, '');
+  const url = base + '/chat/completions';
+  const body = { model: settings.aiModel || 'deepseek-chat', messages, temperature: 0.2, stream: false };
+  if (jsonMode) body.response_format = { type: 'json_object' };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + settings.aiKey },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok){
+    const t = await r.text().catch(() => '');
+    throw new Error('AI 接口 HTTP ' + r.status + ' ' + t.slice(0, 300));
+  }
+  const d = await r.json();
+  const content = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+  if (!content) throw new Error('AI 返回内容为空');
+  return String(content);
+}
+
+/* 近 7 天营业额（用于演示模式图表） */
+function last7DaysRevenue(){
+  const week = [];
+  for (let i = 6; i >= 0; i--){
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const ds = fmtD(d.getTime());
+    const v = r2(db.prepare('SELECT SUM(payable) s FROM sales WHERE time BETWEEN ? AND ?').get(dayStart(d.getTime()), dayEnd(d.getTime())).s || 0);
+    week.push({ label: ds.slice(5), value: v });
+  }
+  return week;
+}
+
+route('POST', '/api/chat', async (req, res) => {
+  const b = await readBody(req);
+  const msg = String(b.message || '').trim();
+  if (!msg) return json(res, 400, { error: '请输入要咨询的问题' });
+  const settings = getSettings();
+
+  // 演示模式：无需密钥，展示"提问 → 查库 → 图表 → 总结"完整管道
+  if (settings.aiProvider === 'demo'){
+    const demoSql = "SELECT name AS 商品, SUM(qty) AS 销量, ROUND(SUM(price*qty),2) AS 销售额 FROM sale_items GROUP BY name ORDER BY 销售额 DESC LIMIT 5";
+    const rows = execAiSql(dbRO || db, demoSql);
+    const lines = rows.map((r, i) => `${i + 1}. ${r['商品']}　销量 ${r['销量']}，销售额 ¥${r['销售额']}`).join('\n');
+    const week = last7DaysRevenue();
+    const demoChart = { type: 'line', title: '近 7 天营业额趋势（演示）', x: week.map(w => w.label), y: week.map(w => w.value) };
+    return json(res, 200, {
+      reply: '【演示模式】AI 查询管道工作正常 ✅（正式使用请在系统设置填写 AI 接口密钥）。\n\n示例：按销售额统计的商品排行：\n' + (lines || '（暂无销售数据）'),
+      sql: demoSql, rows, demo: true, chart: demoChart
+    });
+  }
+
+  if (!settings.aiKey) return json(res, 400, { error: '请先在「系统设置 → AI 助手配置」填写 API 密钥（或选择演示模式）' });
+  const chartIntent = detectChartIntent(msg);
+  try {
+    const sys = buildSystemPrompt();
+    // 意图引导：账单→汇总图；明细→逐笔交易字段（时间、处理人、商品、金额等）
+    const sysExtra = chartIntent === 'force'
+      ? '\n补充指令：用户想看账单/汇总图表。若用户未指明具体范围，请默认查询"最近一个月每天的营业额"（按日分组求和），直接输出 SQL，不要反问用户要哪方面账单。'
+      : chartIntent === 'text'
+        ? '\n补充指令：用户想看逐笔交易明细。请查询交易明细并选择能展示完整信息的字段：格式化后的时间(datetime)、收银员/处理人(cashier)、商品名称(sale_items.name)、数量(qty)、金额(payable)、支付方式(pay_method)、会员姓名(member_name)等，按时间倒序排列，不要聚合汇总。'
+        : '';
+    const first = await callLLM(settings, [
+      { role: 'system', content: sys + sysExtra },
+      { role: 'user', content: msg }
+    ]);
+    const sql = extractSql(first);
+    if (!sql){
+      // 看账单意图但模型未查库 → 服务端自动生成默认账单图表（近 30 天营业额）
+      if (chartIntent === 'force'){
+        const days = [];
+        for (let i = 29; i >= 0; i--){
+          const d = new Date(); d.setDate(d.getDate() - i);
+          const ds = fmtD(d.getTime());
+          const v = r2(db.prepare('SELECT SUM(payable) s FROM sales WHERE time BETWEEN ? AND ?').get(dayStart(d.getTime()), dayEnd(d.getTime())).s || 0);
+          days.push({ label: ds, value: v });
+        }
+        const total = r2(days.reduce((a, d) => a + d.value, 0));
+        const activeDays = days.filter(d => d.value > 0).length;
+        const chart = { type: 'line', title: '近 30 天营业额趋势', x: days.map(d => d.label.slice(5)), y: days.map(d => d.value) };
+        const reply = `已自动生成本期账单汇总（近 30 天）：\n· 总营业额 ¥${total.toFixed(2)}\n· 有营业天数 ${activeDays} 天\n\n可以再指定范围，例如：「查看7月账单」「查看张三的账单」「查看员工李娜的账单」。`;
+        return json(res, 200, { reply, chart, sql: null, rows: null, intent: chartIntent, auto: true });
+      }
+      // 明细意图但模型未查库 → 服务端兜底：最近 20 笔交易逐笔列出
+      if (chartIntent === 'text'){
+        const recent = db.prepare('SELECT * FROM sales ORDER BY time DESC LIMIT 20').all();
+        const items = db.prepare('SELECT * FROM sale_items ORDER BY id DESC LIMIT 500').all();
+        const bySale = {};
+        for (const it of items){ (bySale[it.sale_id] = bySale[it.sale_id] || []).push(it); }
+        const rows = recent.map(s => ({
+          时间: fmtDT(s.time), 单号: s.no, 处理人: s.cashier || '-', 会员: s.member_name || '-',
+          商品: (bySale[s.id] || []).map(it => `${it.name}×${it.qty}`).join('、'),
+          金额: s.payable, 支付: s.pay_method
+        }));
+        return json(res, 200, {
+          reply: `已自动列出最近 ${rows.length} 笔交易明细（每笔含时间与处理人；如需更早或指定日期，请补充说明）：`,
+          rows, sql: null, intent: chartIntent, detail: true
+        });
+      }
+      return json(res, 200, { reply: first, sql: null, rows: null, intent: chartIntent });
+    }
+    const rows = execAiSql(dbRO || db, sql);
+    // 第二段调用：请模型用 JSON 输出"回答 + 可选图表"，让"查看账单/图表"类提问自动配图
+    const jsonMode = !['ollama', 'custom'].includes(settings.aiProvider);
+    const nowD = new Date(); const p2 = n => String(n).padStart(2, '0');
+    const curDate = `${nowD.getFullYear()}-${p2(nowD.getMonth()+1)}-${p2(nowD.getDate())}`;
+    // 意图识别：用户想看"账单/汇总"→ 强制出图；想看"明细"→ 不出图（chartIntent 已在上方定义）
+    const chartInstr = chartIntent === 'force'
+      ? '用户希望以图表形式查看账单/汇总。**必须**输出 chart（按数据选择 bar/line/pie 最合适的），chart 不得为 null。'
+      : chartIntent === 'text'
+        ? '用户想看的是逐笔明细/记录清单，不需要图表，chart 固定为 null。'
+        : '当数据用图表展示更直观（趋势/对比/占比/排行）时给出一张图，否则为 null。';
+    const answerInstr = chartIntent === 'text'
+      ? '请**逐条列出**查询结果中的每一笔交易，不要汇总、不要省略、不要概括成一句话。每笔写明：时间、处理人（收银员/现金ier）、商品、数量、金额、支付方式等字段；开头注明共 N 笔。'
+      : '用简洁的简体中文总结下面的查询结果来回答用户的问题，不要编造或夸大数字；结果为空就如实说明。';
+    const second = await callLLM(settings, [
+      { role: 'system', content: `今天是 ${curDate}（用户问题中未写明年份的日期默认是 ${nowD.getFullYear()} 年）。你是「收银宝」店铺管理系统的数据分析助手。请以 JSON 格式输出，仅两个字段：
+1. "answer"：${answerInstr}
+2. "chart"：${chartInstr}
+   chart 格式：{"type":"bar"|"line"|"pie","title":"标题","x":["标签1","标签2",...],"y":[数值1,数值2,...]}
+   - bar 柱状图：排行/对比（如商品销售额、员工业绩）
+   - line 折线图：随时间趋势（如每日营业额）
+   - pie 饼图：占比分布（如支付方式、分类占比）
+   y 数值保留最多 2 位小数；数据点不超过 40 个；不得传空数组；不要输出 JSON 以外的任何内容。` },
+      { role: 'user', content: '用户问题：' + msg + '\n\n执行的SQL：\n' + sql + '\n\n查询结果(JSON)：\n' + JSON.stringify(rows).slice(0, 8000) }
+    ], jsonMode);
+    const parsed = parseChartContent(second);
+    // 模型未出图时，自动根据结果兜底生成图表
+    const chart = parsed.chart || autoChart(rows);
+    return json(res, 200, { reply: parsed.answer, chart, sql, rows, intent: chartIntent, detail: chartIntent === 'text' });
+  } catch (e){
+    return json(res, 500, { error: 'AI 处理失败：' + e.message });
+  }
+}, { desktopOnly: true });
+
+route('POST', '/api/ai-test', async (req, res) => {
+  const settings = getSettings();
+  if (!settings.aiKey) return json(res, 400, { error: '尚未填写 API 密钥' });
+  try {
+    const t0 = Date.now();
+    const reply = await callLLM(settings, [{ role: 'user', content: '请只回复两个字：正常' }]);
+    return json(res, 200, { ok: true, reply: String(reply).slice(0, 100), ms: Date.now() - t0 });
+  } catch (e){
+    return json(res, 400, { error: e.message });
+  }
+}, { desktopOnly: true });
 
 /* --- 备份下载 --- */
 route('GET', '/api/backup', async (req, res) => {

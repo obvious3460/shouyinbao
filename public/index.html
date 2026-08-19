@@ -160,6 +160,26 @@
   .report .tbl{ margin-top:6px; }
   .report .tbl th{ background:#f8fafc; }
 
+  /* ---------- AI 助手聊天 ---------- */
+  .chat-msg{ display:flex; margin-bottom:10px; }
+  .chat-msg .bubble{ max-width:82%; padding:9px 12px; border-radius:10px; font-size:13px; white-space:pre-wrap; word-break:break-word; line-height:1.6; }
+  .chat-msg.user{ justify-content:flex-end; }
+  .chat-msg.user .bubble{ background:var(--accent); color:#fff; border-bottom-right-radius:2px; }
+  .chat-msg.ai{ justify-content:flex-start; }
+  .chat-msg.ai .bubble{ background:#fff; border:1px solid var(--line); border-bottom-left-radius:2px; }
+  .chat-msg .sql-note{ display:block; font-size:11px; color:var(--muted); margin-top:6px; font-family:Consolas,monospace; word-break:break-all; }
+  .chat-msg .demo-tag{ display:inline-block; background:#fef3c7; color:#b45309; font-size:10px; padding:1px 6px; border-radius:10px; margin-right:6px; vertical-align:middle; }
+  .chat-loading{ color:var(--muted); font-size:12px; padding:4px 2px; }
+  .chart-box{ margin-top:8px; background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .chart-box .c-title{ font-size:12px; color:var(--muted); text-align:center; margin-bottom:6px; }
+  .pie-legend{ font-size:12px; padding:2px 0; white-space:nowrap; }
+  .pie-legend .dot{ display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align:middle; }
+  .detail-wrap{ margin-top:8px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#fff; }
+  .detail-wrap .detail-tbl{ margin:0; }
+  .detail-wrap .detail-tbl th{ white-space:nowrap; }
+  .detail-wrap .detail-tbl td{ font-size:12px; }
+  .detail-wrap .detail-count{ padding:6px 10px; font-size:11px; color:var(--muted); border-top:1px solid var(--line); text-align:right; }
+
   /* ---------- 打印小票 / 打印报表 ---------- */
   #printArea{ display:none; }
   #reportPrintArea{ display:none; }
@@ -189,6 +209,7 @@
     <div class="nav-item" data-view="ledger" onclick="switchView('ledger')">📒 流水账本</div>
     <div class="nav-item" data-view="stats" onclick="switchView('stats')">📈 统计分析</div>
     <div class="nav-item admin-only" data-view="report" onclick="switchView('report')">📑 报表中心</div>
+    <div class="nav-item admin-only" data-view="chat" onclick="switchView('chat')">🤖 AI 助手</div>
     <div class="nav-item admin-only" data-view="settings" onclick="switchView('settings')">⚙️ 系统设置</div>
   </nav>
   <div class="sidebar-foot">电脑开机启动服务后<br>局域网内手机/电脑均可访问</div>
@@ -267,6 +288,7 @@
         </div>
 
         <button class="btn primary big" style="width:100%;margin-top:6px" onclick="settle()">💵 结算收款</button>
+        <label class="field" style="margin-top:10px">收银员（记录到销售单，AI 可查员工工作记录）<input type="text" id="posCashier" list="cashierList" placeholder="默认收银员"></label>
       </div>
     </div>
   </section>
@@ -445,6 +467,19 @@
     </div>
   </section>
 
+  <!-- AI 助手（电脑端） -->
+  <section id="view-chat" class="view">
+    <div class="card" style="display:flex;flex-direction:column;height:calc(100vh - 190px)">
+      <h3>🤖 AI 助手 <span class="hint">用自然语言查数据、整理经营记录（示例：整理张三的消费记录 / 每个员工的销售情况 / 本月卖得最好的商品）</span></h3>
+      <div id="chatMsgs" style="flex:1;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:10px;background:#fafbfc"></div>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="chatInput" placeholder="例如：帮我整理张三最近一个月的消费记录" onkeydown="if(event.key==='Enter')sendChat()">
+        <button class="btn primary" id="chatSendBtn" onclick="sendChat()">发送</button>
+      </div>
+      <p style="font-size:11px;color:var(--muted);margin-top:6px">回答由 AI 生成，仅供参考。AI 只能读取数据，不会修改任何内容。首次使用请先在「系统设置 → AI 助手配置」填写接口信息（或先用演示模式体验）。</p>
+    </div>
+  </section>
+
   <!-- 系统设置（电脑端） -->
   <section id="view-settings" class="view">
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
@@ -473,6 +508,32 @@
           <button class="btn" onclick="resetSample()">🔁 恢复示例数据</button>
           <button class="btn danger" onclick="clearData()">🗑️ 清空所有数据</button>
         </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3>🤖 AI 助手配置 <span class="hint">支持 DeepSeek / OpenAI / 通义千问 / Kimi / Ollama 本地等任意 OpenAI 兼容接口</span></h3>
+      <div class="field-row">
+        <label class="field">服务商
+          <select id="setAiProvider" onchange="onAiProviderChange()">
+            <option value="demo">演示模式（无需密钥，可先体验）</option>
+            <option value="deepseek">DeepSeek（推荐，便宜）</option>
+            <option value="openai">OpenAI</option>
+            <option value="dashscope">通义千问（阿里）</option>
+            <option value="moonshot">Kimi（月之暗面）</option>
+            <option value="ollama">Ollama（本地免费）</option>
+            <option value="custom">自定义（OpenAI 兼容）</option>
+          </select>
+        </label>
+        <label class="field">接口地址（Base URL）<input type="text" id="setAiBaseUrl" placeholder="https://api.deepseek.com"></label>
+      </div>
+      <div class="field-row">
+        <label class="field">API 密钥（API Key）<input type="password" id="setAiKey" placeholder="sk-...（演示模式可不填）"></label>
+        <label class="field">模型名称<input type="text" id="setAiModel" placeholder="deepseek-chat"></label>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn primary" onclick="saveSettings()">保存设置</button>
+        <button class="btn" onclick="testAi()">🧪 测试连接</button>
+        <span id="aiTestResult" style="font-size:13px"></span>
       </div>
     </div>
   </section>
@@ -564,6 +625,7 @@
 <div id="reportPrintArea"></div>
 
 <datalist id="catList"></datalist>
+<datalist id="cashierList"></datalist>
 <datalist id="expCatList">
   <option value="进货"></option>
   <option value="房租"></option>

@@ -63,9 +63,9 @@ function applyDeviceMode(){
 /* ---------- 视图切换 ---------- */
 const PAGE_TITLES = {
   home: '📊 今日概览', pos: '🛒 收银台', stock: '📦 出库入库', products: '📋 商品管理',
-  members: '👤 会员管理', expenses: '💸 出账记账', ledger: '📒 流水账本', stats: '📈 统计分析', report: '📑 报表中心', settings: '⚙️ 系统设置'
+  members: '👤 会员管理', expenses: '💸 出账记账', ledger: '📒 流水账本', stats: '📈 统计分析', report: '📑 报表中心', chat: '🤖 AI 助手', settings: '⚙️ 系统设置'
 };
-const ADMIN_VIEWS = ['products', 'members', 'report', 'settings'];
+const ADMIN_VIEWS = ['products', 'members', 'report', 'chat', 'settings'];
 
 async function switchView(name){
   if (DEVICE === 'mobile' && ADMIN_VIEWS.includes(name)){
@@ -79,7 +79,7 @@ async function switchView(name){
   $('#pageTitle').textContent = PAGE_TITLES[name] || '';
   const renders = {
     home: renderHome, pos: renderPos, stock: renderStock, products: renderProducts, members: renderMembers,
-    expenses: renderExpenses, ledger: renderLedger, stats: renderStats, report: renderReport, settings: renderSettings
+    expenses: renderExpenses, ledger: renderLedger, stats: renderStats, report: renderReport, chat: renderChat, settings: renderSettings
   };
   if (renders[name]) await renders[name]();
 }
@@ -118,6 +118,8 @@ let payMethod = '微信';
 let cashReceived = '';
 
 function renderPos(){
+  if (!$('#posCashier').value) $('#posCashier').value = D.settings.cashier || '';
+  $('#cashierList').innerHTML = D.settings.cashier ? `<option value="${esc(D.settings.cashier)}">` : '';
   renderProductGrid();
   renderCart();
 }
@@ -260,7 +262,8 @@ async function settle(){
         pointsUse,
         manualDiscount,
         payMethod,
-        cashReceived: parseFloat(cashReceived) || null
+        cashReceived: parseFloat(cashReceived) || null,
+        cashier: ($('#posCashier').value || '').trim() || D.settings.cashier
       }
     });
     await refresh();
@@ -651,22 +654,68 @@ function renderSettings(){
   $('#setPointsPerYuan').value = D.settings.pointsPerYuan;
   $('#setPointsToYuan').value = D.settings.pointsToYuan;
   $('#setLowStock').value = D.settings.lowStock;
+  $('#setAiProvider').value = D.settings.aiProvider || 'demo';
+  $('#setAiBaseUrl').value = D.settings.aiBaseUrl || 'https://api.deepseek.com';
+  $('#setAiKey').value = D.settings.aiKey || '';
+  $('#setAiModel').value = D.settings.aiModel || 'deepseek-chat';
+}
+function collectSettings(){
+  return {
+    shopName: $('#setShopName').value.trim() || '收银宝便利店',
+    cashier: $('#setCashier').value.trim() || '收银员',
+    pointsPerYuan: parseFloat($('#setPointsPerYuan').value) || 0,
+    pointsToYuan: parseInt($('#setPointsToYuan').value, 10) || 100,
+    lowStock: parseInt($('#setLowStock').value, 10) || 10,
+    aiProvider: $('#setAiProvider').value,
+    aiBaseUrl: $('#setAiBaseUrl').value.trim(),
+    aiKey: $('#setAiKey').value.trim(),
+    aiModel: $('#setAiModel').value.trim()
+  };
 }
 async function saveSettings(){
   try {
-    await api('/settings', {
-      method: 'PUT',
-      body: {
-        shopName: $('#setShopName').value.trim() || '收银宝便利店',
-        cashier: $('#setCashier').value.trim() || '收银员',
-        pointsPerYuan: parseFloat($('#setPointsPerYuan').value) || 0,
-        pointsToYuan: parseInt($('#setPointsToYuan').value, 10) || 100,
-        lowStock: parseInt($('#setLowStock').value, 10) || 10
-      }
-    });
+    await api('/settings', { method: 'PUT', body: collectSettings() });
     await refresh();
     alert('设置已保存');
   } catch (e){ alert('保存失败：' + e.message); }
+}
+const AI_PRESETS = {
+  deepseek:  { base: 'https://api.deepseek.com', model: 'deepseek-chat' },
+  openai:    { base: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  dashscope: { base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  moonshot:  { base: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+  ollama:    { base: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
+  custom:    { base: '', model: '' },
+  demo:      { base: '', model: '' }
+};
+function onAiProviderChange(){
+  const p = AI_PRESETS[$('#setAiProvider').value];
+  if (p){
+    if (p.base) $('#setAiBaseUrl').value = p.base;
+    if (p.model) $('#setAiModel').value = p.model;
+  }
+}
+async function testAi(){
+  const el = $('#aiTestResult');
+  el.style.color = 'var(--muted)';
+  el.textContent = '测试中…';
+  try {
+    if ($('#setAiProvider').value === 'demo'){
+      el.style.color = 'var(--warn)';
+      el.textContent = 'ℹ️ 演示模式无需密钥，保存后可直接到 AI 助手体验';
+      await api('/settings', { method: 'PUT', body: collectSettings() });
+      await refresh();
+      return;
+    }
+    await api('/settings', { method: 'PUT', body: collectSettings() });  // 先保存当前填写内容
+    await refresh();
+    const r = await api('/ai-test', { method: 'POST' });
+    el.style.color = 'var(--ok)';
+    el.textContent = '✅ 连接成功（' + r.ms + 'ms）' + (r.reply ? ' AI回复：' + r.reply : '');
+  } catch (e){
+    el.style.color = 'var(--danger)';
+    el.textContent = '❌ ' + e.message;
+  }
 }
 function downloadBackup(){
   window.location.href = '/api/backup';
@@ -773,6 +822,129 @@ function exportReportTxt(){
   a.download = `收银宝${reportState.type === 'daily' ? '日报' : reportState.type === 'weekly' ? '周报' : '月报'}_${reportState.date}.txt`;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+/* ============================================================
+ * AI 助手（电脑端）
+ * ============================================================ */
+let chatHistory = [];
+function renderChat(){
+  if (!chatHistory.length){
+    chatHistory = [{
+      role: 'ai', text: '你好，我是收银宝 AI 助手 👋\n你可以这样问我：\n· 整理张三最近的消费记录\n· 每个员工的销售情况\n· 这个月哪类商品卖得最好\n· 今天营业额多少\n· 库存不足的商品有哪些\n\n（若显示「请先配置密钥」，到 系统设置 → AI 助手配置 填写接口信息，或选择演示模式体验）'
+    }];
+  }
+  renderChatMsgs();
+}
+function renderChatMsgs(){
+  $('#chatMsgs').innerHTML = chatHistory.map(m => m.role === 'user'
+    ? `<div class="chat-msg user"><div class="bubble">${esc(m.text)}</div></div>`
+    : `<div class="chat-msg ai"><div class="bubble">${m.demo ? '<span class="demo-tag">演示</span>' : ''}${esc(m.text)}${m.detail && m.rows && m.rows.length ? renderDetailTable(m.rows) : ''}${m.chart ? `<div class="chart-box"><div class="c-title">${esc(m.chart.title)}</div>${renderChart(m.chart)}</div>` : ''}${m.sql ? `<span class="sql-note">SQL：${esc(m.sql)}</span>` : ''}</div></div>`).join('');
+  const box = $('#chatMsgs');
+  box.scrollTop = box.scrollHeight;
+}
+
+/* 明细结果渲染为表格（时间/处理人/商品/金额等逐笔列出） */
+function renderDetailTable(rows){
+  if (!rows || !rows.length) return '';
+  const keys = Object.keys(rows[0] || {});
+  if (!keys.length) return '';
+  const head = keys.map(k => `<th>${esc(k)}</th>`).join('');
+  const body = rows.map(r => `<tr>${keys.map(k => {
+    let v = r[k];
+    if (typeof v === 'number' && v >= 1e11 && v < 1e13) v = fmtDT(v);   // 毫秒时间戳 → 本地时间
+    return `<td>${esc(v)}</td>`;
+  }).join('')}</tr>`).join('');
+  return `<div class="detail-wrap"><table class="tbl detail-tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
+    <div class="detail-count">共 ${rows.length} 条</div></div>`;
+}
+
+/* ---------- 图表渲染（纯 SVG，零依赖） ---------- */
+const CHART_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#64748b'];
+function fmtNum(n){ return (Math.round(n * 100) / 100).toString().replace(/\.00$/, ''); }
+function renderChart(ch){
+  if (ch.type === 'bar') return svgBar(ch);
+  if (ch.type === 'line') return svgLine(ch);
+  if (ch.type === 'pie') return svgPie(ch);
+  return '';
+}
+function svgGrid(W, H, padL, padT, padB, padR){
+  let g = '';
+  for (let i = 0; i <= 4; i++){
+    const gy = H - padB - (i / 4) * (H - padT - padB);
+    g += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="#e2e8f0" stroke-dasharray="3 3"></line>`;
+  }
+  return g;
+}
+function svgBar(c){
+  const W = 560, H = 220, padL = 52, padT = 14, padB = 30, padR = 10;
+  const n = c.x.length, max = Math.max(...c.y, 1);
+  const iw = (W - padL - padR) / n, bw = Math.min(40, iw * 0.6);
+  let bars = '';
+  c.x.forEach((x, i) => {
+    const h = (c.y[i] / max) * (H - padT - padB);
+    const bx = padL + i * iw + (iw - bw) / 2, by = H - padB - h;
+    bars += `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="#3b82f6"></rect>`;
+    bars += `<text x="${(bx + bw / 2).toFixed(1)}" y="${(by - 4).toFixed(1)}" text-anchor="middle" font-size="10" fill="#475569">${fmtNum(c.y[i])}</text>`;
+    bars += `<text x="${(bx + bw / 2).toFixed(1)}" y="${H - padB + 14}" text-anchor="middle" font-size="9" fill="#94a3b8">${esc(String(x).slice(0, 8))}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:560px">${svgGrid(W, H, padL, padT, padB, padR)}${bars}</svg>`;
+}
+function svgLine(c){
+  const W = 560, H = 220, padL = 48, padT = 14, padB = 30, padR = 10;
+  const n = c.x.length, max = Math.max(...c.y, 1);
+  const innerW = W - padL - padR;
+  const pts = c.y.map((v, i) => ({
+    x: padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW),
+    y: H - padB - (v / max) * (H - padT - padB)
+  }));
+  const dots = pts.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.5" fill="#3b82f6"></circle>`).join('');
+  const labels = c.x.map((x, i) => `<text x="${pts[i].x.toFixed(1)}" y="${H - padB + 14}" text-anchor="middle" font-size="9" fill="#94a3b8">${esc(String(x).slice(0, 8))}</text>`).join('');
+  const vals = pts.map((p, i) => `<text x="${p.x.toFixed(1)}" y="${(p.y - 7).toFixed(1)}" text-anchor="middle" font-size="10" fill="#475569">${fmtNum(c.y[i])}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:560px">${svgGrid(W, H, padL, padT, padB, padR)}
+    <polyline points="${pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')}" fill="none" stroke="#2563eb" stroke-width="2.5"></polyline>${dots}${vals}${labels}</svg>`;
+}
+function svgPie(c){
+  const cx = 100, cy = 100, R = 80, r = 50;
+  const total = c.y.reduce((a, b) => a + b, 0) || 1;
+  let ang = -Math.PI / 2, paths = '', legend = '';
+  c.y.forEach((v, i) => {
+    const frac = v / total;
+    const a2 = ang + frac * 2 * Math.PI;
+    const large = (a2 - ang) > Math.PI ? 1 : 0;
+    const x1 = cx + R * Math.cos(ang), y1 = cy + R * Math.sin(ang);
+    const x2 = cx + R * Math.cos(a2), y2 = cy + R * Math.sin(a2);
+    const xi1 = cx + r * Math.cos(ang), yi1 = cy + r * Math.sin(ang);
+    const xi2 = cx + r * Math.cos(a2), yi2 = cy + r * Math.sin(a2);
+    const color = CHART_COLORS[i % CHART_COLORS.length];
+    paths += `<path d="M${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large} 1 ${x2.toFixed(1)},${y2.toFixed(1)} L${xi2.toFixed(1)},${yi2.toFixed(1)} A${r},${r} 0 ${large} 0 ${xi1.toFixed(1)},${yi1.toFixed(1)} Z" fill="${color}"></path>`;
+    legend += `<div class="pie-legend"><span class="dot" style="background:${color}"></span>${esc(String(c.x[i]))} <b>${fmtNum(v)}</b>（${(frac * 100).toFixed(1)}%）</div>`;
+    ang = a2;
+  });
+  return `<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+    <svg viewBox="0 0 200 200" width="160" height="160" style="flex-shrink:0">${paths}</svg>
+    <div style="min-width:150px">${legend}</div></div>`;
+}
+async function sendChat(){
+  const input = $('#chatInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+  chatHistory.push({ role: 'user', text: msg });
+  input.value = '';
+  renderChatMsgs();
+  const btn = $('#chatSendBtn');
+  btn.disabled = true;
+  const loadingIdx = chatHistory.length;
+  chatHistory.push({ role: 'ai', text: '…思考中，请稍候' });
+  renderChatMsgs();
+  try {
+    const r = await api('/chat', { method: 'POST', body: { message: msg } });
+    chatHistory[loadingIdx] = { role: 'ai', text: r.reply, sql: r.sql || null, demo: !!r.demo, chart: r.chart || null, rows: r.rows || null, detail: !!r.detail };
+  } catch (e){
+    chatHistory[loadingIdx] = { role: 'ai', text: '⚠️ ' + e.message };
+  }
+  btn.disabled = false;
+  renderChatMsgs();
 }
 
 /* ============================================================
