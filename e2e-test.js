@@ -2,6 +2,7 @@
 /* 收银宝服务端 端到端自测（Node 24 自带 fetch） */
 const BASE = 'http://127.0.0.1:3000';
 let pass = 0, fail = 0;
+let mobileCookie = '';
 function check(name, cond, extra){
   if (cond){ pass++; console.log('PASS  ' + name + (extra ? '  ' + extra : '')); }
   else { fail++; console.log('FAIL  ' + name + (extra ? '  ' + extra : '')); }
@@ -9,8 +10,11 @@ function check(name, cond, extra){
 async function req(path, opts){
   const init = { method: (opts && opts.method) || 'GET', headers: {} };
   if (opts && opts.ua) init.headers['User-Agent'] = opts.ua;
+  if (opts && opts.ua && /mobile|android|iphone|ipad|ipod/i.test(opts.ua) && mobileCookie) init.headers.Cookie = mobileCookie;
   if (opts && opts.body !== undefined){ init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
   const r = await fetch(BASE + path, init);
+  const setCookie = r.headers.get('set-cookie');
+  if (setCookie && path === '/api/login') mobileCookie = setCookie.split(';')[0];
   let data = null;
   try { data = await r.json(); } catch (e) {}
   return { status: r.status, data };
@@ -31,6 +35,10 @@ async function req(path, opts){
   // 3. bootstrap（手机 UA）
   const bootM = await req('/api/bootstrap', { ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605 Mobile' });
   check('手机 UA 识别=mobile', bootM.data.device === 'mobile');
+  const login = await req('/api/login', { method: 'POST', ua: 'Mozilla/5.0 (iPhone) Mobile', body: { username: 'employee', password: '123456' } });
+  check('手机员工登录成功', login.status === 200 && login.data.employee && login.data.employee.name);
+  const bootLogged = await req('/api/bootstrap', { ua: 'Mozilla/5.0 (iPhone) Mobile' });
+  check('手机登录状态返回员工', bootLogged.data.employee && bootLogged.data.employee.id === login.data.employee.id);
 
   // 4. 结算：金卡会员(92折) + 整单9折 + 500积分(100分=1元)
   // 可乐3.00×10=30 + 薯片6.00×2=12 → 小计42
@@ -76,12 +84,14 @@ async function req(path, opts){
   });
   check('现金不足被拦截', s3.status === 400, 'status=' + s3.status);
 
-  // 9. 出入库
-  const st1 = await req('/api/stock', { method: 'POST', ua: 'Mozilla/5.0 (iPhone) Mobile', body: { productId: 11, type: 'in', qty: 50, note: '补货测试' } });
-  check('入库成功(手机)', st1.status === 200 && st1.data.newStock === 50, 'stock=' + (st1.data && st1.data.newStock));
-  const st2 = await req('/api/stock', { method: 'POST', ua: 'Mozilla/5.0 (iPhone) Mobile', body: { productId: 11, type: 'out', qty: 10, note: '损耗测试' } });
-  check('出库成功(手机)', st2.status === 200 && st2.data.newStock === 40, 'stock=' + (st2.data && st2.data.newStock));
-  const moves = await req('/api/stock-moves');
+  // 9. 出入库仅电脑端
+  const st1 = await req('/api/stock', { method: 'POST', ua: 'Mozilla/5.0 (Windows NT 10.0)', body: { productId: 11, type: 'in', qty: 50, note: '补货测试' } });
+  check('入库成功(电脑)', st1.status === 200 && st1.data.newStock === 50, 'stock=' + (st1.data && st1.data.newStock));
+  const st2 = await req('/api/stock', { method: 'POST', ua: 'Mozilla/5.0 (Windows NT 10.0)', body: { productId: 11, type: 'out', qty: 10, note: '损耗测试' } });
+  check('出库成功(电脑)', st2.status === 200 && st2.data.newStock === 40, 'stock=' + (st2.data && st2.data.newStock));
+  const stMobile = await req('/api/stock', { method: 'POST', ua: 'Mozilla/5.0 (iPhone) Mobile', body: { productId: 11, type: 'in', qty: 1 } });
+  check('手机出入库被拦截', stMobile.status === 403, 'status=' + stMobile.status);
+  const moves = await req('/api/stock-moves', { ua: 'Mozilla/5.0 (Windows NT 10.0)' });
   check('出入库记录=2条', moves.data.length === 2, 'n=' + moves.data.length);
 
   // 10. 手机权限拦截：不能改商品价格 / 不能删等级
@@ -90,7 +100,11 @@ async function req(path, opts){
   const mb2 = await req('/api/settings', { method: 'PUT', ua: 'Mozilla/5.0 (Android) Mobile', body: { shopName: 'x' } });
   check('手机改设置被拦截 403', mb2.status === 403, 'status=' + mb2.status);
   const mb3 = await req('/api/sales', { method: 'POST', ua: 'Mozilla/5.0 (iPhone) Mobile', body: { items: [{ productId: 2, qty: 1 }], memberId: null, pointsUse: 0, manualDiscount: 100, payMethod: '微信' } });
-  check('手机收银不被拦截', mb3.status === 200, 'status=' + mb3.status);
+  check('手机销售记账不被拦截', mb3.status === 200, 'status=' + mb3.status);
+  const mb4 = await req('/api/sales', { ua: 'Mozilla/5.0 (iPhone) Mobile' });
+  check('手机查看销售流水被拦截', mb4.status === 403, 'status=' + mb4.status);
+  const mb5 = await req('/api/stats', { ua: 'Mozilla/5.0 (iPhone) Mobile' });
+  check('手机查看统计被拦截', mb5.status === 403, 'status=' + mb5.status);
 
   // 11. 桌面端改价成功
   const pc = await req('/api/products/1', { method: 'PUT', ua: 'Mozilla/5.0 (Windows NT 10.0)', body: { name: '可口可乐', category: '饮料', price: 3.5, cost: 2.1, stock: 110, unit: '瓶' } });
@@ -104,7 +118,7 @@ async function req(path, opts){
   const exDel = await req('/api/expenses/' + ex.data.id, { method: 'DELETE', ua: 'Mozilla/5.0 (iPhone) Mobile' });
   check('手机删除出账被拦截', exDel.status === 403, 'status=' + exDel.status);
 
-  // 13. 统计与概览
+  // 13. 统计与概览（电脑端）
   const today = new Date(); const p2 = n => String(n).padStart(2, '0');
   const ds = today.getFullYear() + '-' + p2(today.getMonth()+1) + '-' + p2(today.getDate());
   const st = await req('/api/stats?from=' + ds + '&to=' + ds);

@@ -8,14 +8,15 @@
  * 数据库：data/shouyinbao.db（真实 SQLite 文件，可复制备份）
  *
  * 权限：按设备类型区分（User-Agent 判断）
- *   - 手机端：可记录销售、出库入库、出账、查看；不可改商品/会员/设置/等级
- *   - 电脑端：全部权限（含价格编辑）
+ *   - 手机端：仅可新增销售和支出记账，不可查看历史流水、统计或管理数据
+ *   - 电脑端：可查看流水、统计，并拥有完整管理权限
  * ============================================================ */
 
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { buildSystemPrompt, extractSql, execAiSql, parseChartContent, autoChart, detectChartIntent } = require('./ai-lib.js');
 
@@ -61,6 +62,14 @@ CREATE TABLE IF NOT EXISTS members (
   points     INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS employees (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  username      TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  active        INTEGER NOT NULL DEFAULT 1,
+  created_at    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sales (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   no                  TEXT NOT NULL,
@@ -80,7 +89,9 @@ CREATE TABLE IF NOT EXISTS sales (
   member_id           INTEGER,
   member_name         TEXT,
   member_level        TEXT,
-  cashier             TEXT
+  cashier             TEXT,
+  employee_id         INTEGER,
+  employee_name       TEXT
 );
 CREATE TABLE IF NOT EXISTS sale_items (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +108,9 @@ CREATE TABLE IF NOT EXISTS expenses (
   time     INTEGER NOT NULL,
   category TEXT NOT NULL,
   amount   REAL NOT NULL,
-  note     TEXT DEFAULT ''
+  note     TEXT DEFAULT '',
+  employee_id INTEGER,
+  employee_name TEXT
 );
 CREATE TABLE IF NOT EXISTS stock_moves (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +126,14 @@ CREATE TABLE IF NOT EXISTS stock_moves (
 try {
   const cols = db.prepare('PRAGMA table_info(sales)').all().map(c => c.name);
   if (!cols.includes('cashier')) db.exec('ALTER TABLE sales ADD COLUMN cashier TEXT');
+  if (!cols.includes('employee_id')) db.exec('ALTER TABLE sales ADD COLUMN employee_id INTEGER');
+  if (!cols.includes('employee_name')) db.exec('ALTER TABLE sales ADD COLUMN employee_name TEXT');
 } catch (e) { console.warn('[迁移] sales.cashier 列添加失败：', e.message); }
+try {
+  const cols = db.prepare('PRAGMA table_info(expenses)').all().map(c => c.name);
+  if (!cols.includes('employee_id')) db.exec('ALTER TABLE expenses ADD COLUMN employee_id INTEGER');
+  if (!cols.includes('employee_name')) db.exec('ALTER TABLE expenses ADD COLUMN employee_name TEXT');
+} catch (e) { console.warn('[迁移] expenses.employee 列添加失败：', e.message); }
 
 /* AI 查询使用的只读连接（双重安全：白名单 + 只读） */
 let dbRO = null;
@@ -156,6 +176,17 @@ function seedIfEmpty(){
 }
 seedIfEmpty();
 
+function ensureDefaultEmployee(){
+  const row = db.prepare('SELECT id, username, name, active, created_at FROM employees ORDER BY id LIMIT 1').get();
+  if (row) return row;
+  const createdAt = Date.now();
+  const r = db.prepare('INSERT INTO employees (username, name, password_hash, active, created_at) VALUES (?, ?, ?, 1, ?)')
+    .run('employee', '默认员工', hashPassword('123456'), createdAt);
+  console.log('  默认员工账号已创建：employee / 123456（请在电脑端员工管理中修改密码）');
+  return db.prepare('SELECT id, username, name, active, created_at FROM employees WHERE id = ?').get(Number(r.lastInsertRowid));
+}
+ensureDefaultEmployee();
+
 /* ---------- 设置 ---------- */
 const SETTING_DEFAULTS = {
   shopName: '收银宝便利店', cashier: '收银员', pointsPerYuan: 1, pointsToYuan: 100, lowStock: 10,
@@ -190,9 +221,9 @@ function isMobile(req){
   const ua = String(req.headers['user-agent'] || '').toLowerCase();
   return /mobile|android|iphone|ipad|ipod|windows phone/i.test(ua);
 }
-function json(res, code, obj){
+function json(res, code, obj, extraHeaders){
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...(extraHeaders || {}) });
   res.end(body);
 }
 function readBody(req){
@@ -204,6 +235,72 @@ function readBody(req){
   });
 }
 function num(v, def){ const n = parseFloat(v); return isNaN(n) ? def : n; }
+
+/* ---------- 员工登录与记录归属 ---------- */
+const SESSION_COOKIE = 'shouyinbao_session';
+const sessions = new Map();
+const SESSION_TTL = 30 * 24 * 60 * 60 * 1000;
+function hashPassword(password){
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+function verifyPassword(password, stored){
+  const parts = String(stored || '').split(':');
+  if (parts.length !== 2) return false;
+  try {
+    const actual = crypto.scryptSync(String(password), parts[0], 64);
+    const expected = Buffer.from(parts[1], 'hex');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  } catch (e) { return false; }
+}
+function parseCookies(req){
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')){
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function getEmployee(req){
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return null;
+  const session = sessions.get(token);
+  if (!session || session.expiresAt < Date.now()){
+    sessions.delete(token);
+    return null;
+  }
+  const employee = db.prepare('SELECT id, username, name, active, created_at FROM employees WHERE id = ?').get(session.employeeId);
+  if (!employee || !employee.active){
+    sessions.delete(token);
+    return null;
+  }
+  session.expiresAt = Date.now() + SESSION_TTL;
+  return employee;
+}
+function publicEmployee(employee){
+  return employee ? { id: employee.id, username: employee.username, name: employee.name, active: !!employee.active } : null;
+}
+function employeeForRecord(req, body){
+  const signedIn = getEmployee(req);
+  if (signedIn) return signedIn;
+  const id = parseInt(body && body.employeeId, 10);
+  if (id){
+    const selected = db.prepare('SELECT id, username, name, active, created_at FROM employees WHERE id = ? AND active = 1').get(id);
+    if (selected) return selected;
+  }
+  const cashier = String((body && body.cashier) || '').trim();
+  if (cashier){
+    return db.prepare('SELECT id, username, name, active, created_at FROM employees WHERE name = ? AND active = 1').get(cashier) || null;
+  }
+  return null;
+}
+function requireMobileEmployee(req, res){
+  if (!isMobile(req)) return getEmployee(req);
+  const employee = getEmployee(req);
+  if (!employee) json(res, 401, { error: '请先登录员工账号' });
+  return employee;
+}
 
 /* ---------- 折扣计算（与前端一致，服务端为准） ---------- */
 function calcSale(items, member, pointsUse, manualDiscount, settings){
@@ -241,17 +338,41 @@ function route(method, pattern, handler, opts){
 }
 
 /* --- 系统 --- */
+route('POST', '/api/login', async (req, res) => {
+  const b = await readBody(req);
+  const username = String(b.username || '').trim();
+  const password = String(b.password || '');
+  const employee = db.prepare('SELECT id, username, name, password_hash, active, created_at FROM employees WHERE username = ?').get(username);
+  if (!employee || !employee.active || !verifyPassword(password, employee.password_hash)){
+    return json(res, 401, { error: '账号或密码错误' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, { employeeId: employee.id, expiresAt: Date.now() + SESSION_TTL });
+  json(res, 200, { employee: publicEmployee(employee) }, {
+    'Set-Cookie': `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL / 1000)}`
+  });
+});
+route('POST', '/api/logout', async (req, res) => {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (token) sessions.delete(token);
+  json(res, 200, { ok: true }, { 'Set-Cookie': `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` });
+});
 route('GET', '/api/bootstrap', async (req, res) => {
+  const mobile = isMobile(req);
+  const employee = getEmployee(req);
   json(res, 200, {
     settings: getSettings(),
     levels: db.prepare('SELECT * FROM levels ORDER BY id').all(),
     products: db.prepare('SELECT * FROM products ORDER BY id').all(),
     members: db.prepare('SELECT * FROM members ORDER BY id').all(),
-    device: isMobile(req) ? 'mobile' : 'desktop'
+    employees: mobile ? [] : db.prepare('SELECT id, username, name, active, created_at FROM employees ORDER BY id').all(),
+    employee: publicEmployee(employee),
+    requiresLogin: mobile,
+    device: mobile ? 'mobile' : 'desktop'
   });
 });
 
-route('GET', '/api/settings', async (req, res) => json(res, 200, getSettings()));
+route('GET', '/api/settings', async (req, res) => json(res, 200, getSettings()), { desktopOnly: true });
 route('PUT', '/api/settings', async (req, res) => {
   const b = await readBody(req);
   setSetting('shopName', String(b.shopName || '收银宝便利店'));
@@ -278,8 +399,49 @@ route('POST', '/api/clear', async (req, res) => {
   json(res, 200, { ok: true });
 }, { desktopOnly: true });
 
+/* --- 员工管理（电脑端） --- */
+route('GET', '/api/employees', async (req, res) => {
+  json(res, 200, db.prepare('SELECT id, username, name, active, created_at FROM employees ORDER BY id').all());
+}, { desktopOnly: true });
+route('POST', '/api/employees', async (req, res) => {
+  const b = await readBody(req);
+  const username = String(b.username || '').trim();
+  const name = String(b.name || '').trim();
+  const password = String(b.password || '');
+  if (!username || !/^[\u4e00-\u9fffA-Za-z0-9_.-]{2,32}$/.test(username)) return json(res, 400, { error: '账号需为 2~32 位中文、字母、数字或 _.-' });
+  if (!name) return json(res, 400, { error: '员工姓名不能为空' });
+  if (password.length < 6) return json(res, 400, { error: '密码至少需要 6 位' });
+  try {
+    const r = db.prepare('INSERT INTO employees (username, name, password_hash, active, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(username, name, hashPassword(password), b.active === false ? 0 : 1, Date.now());
+    json(res, 200, { id: Number(r.lastInsertRowid) });
+  } catch (e){
+    if (String(e.message).includes('UNIQUE')) return json(res, 400, { error: '账号已存在' });
+    throw e;
+  }
+}, { desktopOnly: true });
+route('PUT', '/api/employees/:id', async (req, res, p) => {
+  const b = await readBody(req);
+  const id = parseInt(p.id, 10);
+  const name = String(b.name || '').trim();
+  const password = String(b.password || '');
+  if (!name) return json(res, 400, { error: '员工姓名不能为空' });
+  if (password && password.length < 6) return json(res, 400, { error: '密码至少需要 6 位' });
+  const active = b.active === false ? 0 : 1;
+  if (password) db.prepare('UPDATE employees SET name=?, active=?, password_hash=? WHERE id=?').run(name, active, hashPassword(password), id);
+  else db.prepare('UPDATE employees SET name=?, active=? WHERE id=?').run(name, active, id);
+  json(res, 200, { ok: true });
+}, { desktopOnly: true });
+route('DELETE', '/api/employees/:id', async (req, res, p) => {
+  const id = parseInt(p.id, 10);
+  const total = db.prepare('SELECT COUNT(*) c FROM employees').get().c;
+  if (total <= 1) return json(res, 400, { error: '至少保留一个员工账号' });
+  db.prepare('DELETE FROM employees WHERE id = ?').run(id);
+  json(res, 200, { ok: true });
+}, { desktopOnly: true });
+
 /* --- 商品 --- */
-route('GET', '/api/products', async (req, res) => json(res, 200, db.prepare('SELECT * FROM products ORDER BY id').all()));
+route('GET', '/api/products', async (req, res) => json(res, 200, db.prepare('SELECT * FROM products ORDER BY id').all()), { desktopOnly: true });
 route('POST', '/api/products', async (req, res) => {
   const b = await readBody(req);
   const name = String(b.name || '').trim();
@@ -302,7 +464,7 @@ route('DELETE', '/api/products/:id', async (req, res, p) => {
 }, { desktopOnly: true });
 
 /* --- 会员 --- */
-route('GET', '/api/members', async (req, res) => json(res, 200, db.prepare('SELECT * FROM members ORDER BY id').all()));
+route('GET', '/api/members', async (req, res) => json(res, 200, db.prepare('SELECT * FROM members ORDER BY id').all()), { desktopOnly: true });
 route('POST', '/api/members', async (req, res) => {
   const b = await readBody(req);
   const name = String(b.name || '').trim();
@@ -325,7 +487,7 @@ route('DELETE', '/api/members/:id', async (req, res, p) => {
 }, { desktopOnly: true });
 
 /* --- 等级 --- */
-route('GET', '/api/levels', async (req, res) => json(res, 200, db.prepare('SELECT * FROM levels ORDER BY id').all()));
+route('GET', '/api/levels', async (req, res) => json(res, 200, db.prepare('SELECT * FROM levels ORDER BY id').all()), { desktopOnly: true });
 route('POST', '/api/levels', async (req, res) => {
   const b = await readBody(req);
   const name = String(b.name || '').trim();
@@ -355,16 +517,19 @@ route('DELETE', '/api/levels/:id', async (req, res, p) => {
 }, { desktopOnly: true });
 
 /* --- 出账 --- */
-route('GET', '/api/expenses', async (req, res) => json(res, 200, db.prepare('SELECT * FROM expenses ORDER BY time DESC').all()));
+route('GET', '/api/expenses', async (req, res) => json(res, 200, db.prepare('SELECT * FROM expenses ORDER BY time DESC').all()), { desktopOnly: true });
 route('POST', '/api/expenses', async (req, res) => {
   const b = await readBody(req);
+  const signedIn = requireMobileEmployee(req, res);
+  if (isMobile(req) && !signedIn) return;
   const cat = String(b.category || '').trim();
   const amount = num(b.amount, 0);
   if (!cat) return json(res, 400, { error: '类别不能为空' });
   if (amount <= 0) return json(res, 400, { error: '金额需大于 0' });
   const time = typeof b.time === 'number' ? b.time : new Date(String(b.date || fmtD(Date.now())) + 'T00:00:00').getTime();
-  const r = db.prepare('INSERT INTO expenses (time, category, amount, note) VALUES (?, ?, ?, ?)')
-    .run(time, cat, r2(amount), String(b.note || '').trim());
+  const employee = signedIn || employeeForRecord(req, b);
+  const r = db.prepare('INSERT INTO expenses (time, category, amount, note, employee_id, employee_name) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(time, cat, r2(amount), String(b.note || '').trim(), employee ? employee.id : null, employee ? employee.name : null);
   json(res, 200, { id: Number(r.lastInsertRowid) });
 }, {});
 route('PUT', '/api/expenses/:id', async (req, res, p) => {
@@ -374,8 +539,11 @@ route('PUT', '/api/expenses/:id', async (req, res, p) => {
   if (!cat) return json(res, 400, { error: '类别不能为空' });
   if (amount <= 0) return json(res, 400, { error: '金额需大于 0' });
   const time = typeof b.time === 'number' ? b.time : new Date(String(b.date || fmtD(Date.now())) + 'T00:00:00').getTime();
-  db.prepare('UPDATE expenses SET time=?, category=?, amount=?, note=? WHERE id=?')
-    .run(time, cat, r2(amount), String(b.note || '').trim(), parseInt(p.id, 10));
+  const old = db.prepare('SELECT employee_id, employee_name FROM expenses WHERE id=?').get(parseInt(p.id, 10));
+  const employee = employeeForRecord(req, b);
+  db.prepare('UPDATE expenses SET time=?, category=?, amount=?, note=?, employee_id=?, employee_name=? WHERE id=?')
+    .run(time, cat, r2(amount), String(b.note || '').trim(), employee ? employee.id : (old && old.employee_id) || null,
+      employee ? employee.name : (old && old.employee_name) || null, parseInt(p.id, 10));
   json(res, 200, { ok: true });
 }, { desktopOnly: true });
 route('DELETE', '/api/expenses/:id', async (req, res, p) => {
@@ -386,11 +554,14 @@ route('DELETE', '/api/expenses/:id', async (req, res, p) => {
 /* --- 销售结算（事务：销售单 + 明细 + 扣库存 + 会员积分） --- */
 route('POST', '/api/sales', async (req, res) => {
   const b = await readBody(req);
+  const signedIn = requireMobileEmployee(req, res);
+  if (isMobile(req) && !signedIn) return;
   if (!Array.isArray(b.items) || b.items.length === 0) return json(res, 400, { error: '购物车为空' });
-  let s, member, payMethod, cashReceived, change, cashier;
+  let s, member, payMethod, cashReceived, change, cashier, employee;
   try {
     const settings = getSettings();
-    cashier = String(b.cashier || settings.cashier || '').trim();
+    employee = signedIn || employeeForRecord(req, b);
+    cashier = employee ? employee.name : String(b.cashier || settings.cashier || '').trim();
     member = b.memberId ? db.prepare('SELECT * FROM members WHERE id = ?').get(parseInt(b.memberId, 10)) : null;
     s = calcSale(b.items, member, b.pointsUse, b.manualDiscount, settings);
     payMethod = String(b.payMethod || '微信');
@@ -410,13 +581,13 @@ route('POST', '/api/sales', async (req, res) => {
   try {
     const r = db.prepare(`INSERT INTO sales (no, time, subtotal, manual_rate, manual_discount_amt, vip_rate, vip_discount,
         points_used, points_value, points_earned, payable, pay_method, cash_received, "change",
-        member_id, member_name, member_level, cashier)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        member_id, member_name, member_level, cashier, employee_id, employee_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(no, time, s.subtotal, s.manualRate, s.manualDiscountAmt, s.vipRate, s.vipDiscount,
         s.pointsUsed, s.pointsValue, s.pointsEarned, s.payable, payMethod, cashReceived, change,
         member ? member.id : null, member ? member.name : null,
         member ? (db.prepare('SELECT name FROM levels WHERE id = ?').get(member.level_id) || {}).name : null,
-        cashier);
+        cashier, employee ? employee.id : null, employee ? employee.name : null);
     const saleId = Number(r.lastInsertRowid);
 
     const insItem = db.prepare('INSERT INTO sale_items (sale_id, product_id, name, category, price, cost, qty) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -439,7 +610,8 @@ route('POST', '/api/sales', async (req, res) => {
       subtotal: s.subtotal, manualDiscountAmt: s.manualDiscountAmt, vipDiscount: s.vipDiscount,
       pointsUsed: s.pointsUsed, pointsValue: s.pointsValue, pointsEarned: s.pointsEarned,
       payable: s.payable, payMethod, cashReceived, change,
-      memberName: member ? member.name : null, memberLevel: member ? (db.prepare('SELECT name FROM levels WHERE id = ?').get(member.level_id) || {}).name : null
+      memberName: member ? member.name : null, memberLevel: member ? (db.prepare('SELECT name FROM levels WHERE id = ?').get(member.level_id) || {}).name : null,
+      cashier, employeeId: employee ? employee.id : null, employeeName: employee ? employee.name : null
     });
   } catch (e){
     db.exec('ROLLBACK');
@@ -468,7 +640,7 @@ route('GET', '/api/sales', async (req, res, rparams, url) => {
   for (const it of items){ (bySale[it.sale_id] = bySale[it.sale_id] || []).push(it); }
   for (const s of sales) s.items = bySale[s.id] || [];
   json(res, 200, sales);
-});
+}, { desktopOnly: true });
 
 /* --- 出入库 --- */
 route('POST', '/api/stock', async (req, res) => {
@@ -493,7 +665,7 @@ route('POST', '/api/stock', async (req, res) => {
     db.exec('ROLLBACK');
     throw e;
   }
-});
+}, { desktopOnly: true });
 route('GET', '/api/stock-moves', async (req, res, params, url) => {
   const limit = Math.min(200, parseInt(url.searchParams.get('limit') || '50', 10));
   const moves = db.prepare('SELECT * FROM stock_moves ORDER BY id DESC LIMIT ?').all(limit);
@@ -501,7 +673,7 @@ route('GET', '/api/stock-moves', async (req, res, params, url) => {
   for (const p of db.prepare('SELECT id, name FROM products').all()) names[p.id] = p.name;
   for (const m of moves) m.productName = names[m.product_id] || ('#' + m.product_id);
   json(res, 200, moves);
-});
+}, { desktopOnly: true });
 
 /* --- 首页概览 --- */
 route('GET', '/api/dashboard', async (req, res) => {
@@ -518,7 +690,7 @@ route('GET', '/api/dashboard', async (req, res) => {
   for (const e of expRows) recent.push({ time: e.time, kind: 'out', text: '出账 · ' + e.category, amt: -e.amount, note: e.note || '' });
   recent.sort((a, b) => b.time - a.time);
   json(res, 200, { orders: saleRows.length, revenue, expense, net: r2(revenue - expense), lowStock: lowStock.slice(0, 12), recent: recent.slice(0, 8) });
-});
+}, { desktopOnly: true });
 
 /* --- 统计分析 --- */
 route('GET', '/api/stats', async (req, res, params, url) => {
@@ -548,7 +720,7 @@ route('GET', '/api/stats', async (req, res, params, url) => {
   const categories = Object.entries(catMap).map(([name, value]) => ({ name, value: r2(value) })).sort((a, b) => b.value - a.value);
 
   json(res, 200, { orders: sales.length, revenue, vipGive, expense, gross, net: r2(gross - expense), week, categories });
-});
+}, { desktopOnly: true });
 
 /* --- 报表（日报 / 周报 / 月报） --- */
 route('GET', '/api/report', async (req, res, params, url) => {
@@ -633,7 +805,7 @@ route('GET', '/api/report', async (req, res, params, url) => {
     summary: { orders, revenue, avgOrder, vipGive, pointsIssued, gross, expense, net: r2(gross - expense), newMembers },
     daily, topProducts, payMethods, expenseCats, expenseList: exps.slice(0, 30)
   });
-});
+}, { desktopOnly: true });
 
 /* --- AI 助手 --- */
 async function callLLM(settings, messages, jsonMode){
@@ -792,7 +964,7 @@ route('GET', '/api/backup', async (req, res) => {
     'Content-Disposition': `attachment; filename="${fname}"`
   });
   fs.createReadStream(DB_FILE).pipe(res);
-});
+}, { desktopOnly: true });
 
 /* ---------- 静态文件 ---------- */
 const MIME = {
@@ -873,7 +1045,7 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   console.log('  数据库文件: ' + DB_FILE);
   console.log('  备份目录:   ' + BACKUP_DIR + '（每天 23:00 自动备份，保留 7 天）');
-  console.log('  手机端仅可记录与出入库；价格等管理请在电脑端操作');
+  console.log('  手机端仅可新增销售/支出记账；流水与统计请在电脑端查看');
   console.log('==============================================');
 });
 
