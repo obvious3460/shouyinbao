@@ -2,7 +2,7 @@
 /* ============================================================
  * 收银宝前端（服务端版）—— API 客户端
  * 所有数据通过 /api/* 读写服务器 SQLite 数据库
- * 设备权限：手机端仅记录+出入库；电脑端完整管理（含价格编辑）
+ * 设备权限：手机端仅新增销售/支出记账；电脑端查看流水统计并完整管理
  * ============================================================ */
 
 const $  = sel => document.querySelector(sel);
@@ -49,27 +49,53 @@ async function api(path, opts){
 async function refresh(){ D = await api('/bootstrap'); DEVICE = D.device; applyDeviceMode(); }
 
 function applyDeviceMode(){
-  $('#deviceTag').textContent = DEVICE === 'mobile'
-    ? '📱 手机模式：记录 / 出库入库'
-    : '💻 电脑模式：完整管理';
-  const admin = DEVICE === 'mobile';
-  $$('.admin-only').forEach(el => el.style.display = admin ? 'none' : '');
-  // 手机端隐藏管理类弹窗按钮
-  if (admin){
-    $$('.admin-only').forEach(el => el.style.display = 'none');
+  const mobile = DEVICE === 'mobile';
+  $('#deviceTag').textContent = mobile
+    ? '📱 手机模式：仅新增记账'
+    : '💻 电脑模式：查看流水 / 统计 / 完整管理';
+  const allowed = mobile ? MOBILE_VIEWS : null;
+  $$('.nav-item').forEach(el => {
+    const hidden = allowed && !allowed.has(el.dataset.view);
+    el.style.display = hidden ? 'none' : '';
+  });
+  $$('.view').forEach(el => {
+    const name = el.id.replace(/^view-/, '');
+    if (allowed && !allowed.has(name)) el.style.display = 'none';
+  });
+  $$('.admin-only').forEach(el => el.style.display = mobile ? 'none' : '');
+  const posNav = document.querySelector('.nav-item[data-view="pos"]');
+  if (posNav) posNav.textContent = mobile ? '🧾 销售记账' : '🛒 收银台';
+  const employeeStatus = $('#employeeStatus');
+  if (employeeStatus){
+    employeeStatus.className = 'employee-status';
+    employeeStatus.innerHTML = D.employee
+      ? `👤 ${esc(D.employee.name)} <button class="logout" onclick="logoutEmployee()">退出</button>`
+      : '';
+  }
+  ['#posEmployeeRow', '#posCashierRow', '#expenseEmployeeRow'].forEach(sel => {
+    const el = $(sel);
+    if (el) el.style.display = mobile ? 'none' : '';
+  });
+  const expenseHistory = $('#expenseHistory');
+  const expenseHistoryTools = $('#expenseHistoryTools');
+  if (mobile){
+    if (expenseHistory) expenseHistory.style.display = 'none';
+    if (expenseHistoryTools) expenseHistoryTools.style.display = 'none';
+  } else {
+    if (expenseHistory) expenseHistory.style.display = '';
+    if (expenseHistoryTools) expenseHistoryTools.style.display = 'contents';
   }
 }
 
 /* ---------- 视图切换 ---------- */
 const PAGE_TITLES = {
   home: '📊 今日概览', pos: '🛒 收银台', stock: '📦 出库入库', products: '📋 商品管理',
-  members: '👤 会员管理', expenses: '💸 出账记账', ledger: '📒 流水账本', stats: '📈 统计分析', report: '📑 报表中心', chat: '🤖 AI 助手', settings: '⚙️ 系统设置'
+  members: '👤 会员管理', employees: '👷 员工管理', expenses: '💸 出账记账', ledger: '📒 流水账本', stats: '📈 统计分析', report: '📑 报表中心', chat: '🤖 AI 助手', settings: '⚙️ 系统设置'
 };
-const ADMIN_VIEWS = ['products', 'members', 'report', 'chat', 'settings'];
+const MOBILE_VIEWS = new Set(['pos', 'expenses']);
 
 async function switchView(name){
-  if (DEVICE === 'mobile' && ADMIN_VIEWS.includes(name)){
-    alert('手机端仅支持记录与出库入库，管理功能请在电脑端操作');
+  if (DEVICE === 'mobile' && !MOBILE_VIEWS.has(name)){
     return;
   }
   $$('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === name));
@@ -79,12 +105,22 @@ async function switchView(name){
   $('#pageTitle').textContent = PAGE_TITLES[name] || '';
   const renders = {
     home: renderHome, pos: renderPos, stock: renderStock, products: renderProducts, members: renderMembers,
-    expenses: renderExpenses, ledger: renderLedger, stats: renderStats, report: renderReport, chat: renderChat, settings: renderSettings
+    employees: renderEmployees, expenses: renderExpenses, ledger: renderLedger, stats: renderStats, report: renderReport, chat: renderChat, settings: renderSettings
   };
   if (renders[name]) await renders[name]();
 }
-function openModal(id){ $(id).classList.add('show'); }
-function closeModal(id){ $(id).classList.remove('show'); }
+function modalElement(id){
+  const key = String(id || '');
+  return key.startsWith('#') ? $(key) : document.getElementById(key);
+}
+function openModal(id){
+  const el = modalElement(id);
+  if (el) el.classList.add('show');
+}
+function closeModal(id){
+  const el = modalElement(id);
+  if (el) el.classList.remove('show');
+}
 
 /* ============================================================
  * 首页概览
@@ -120,6 +156,14 @@ let cashReceived = '';
 function renderPos(){
   if (!$('#posCashier').value) $('#posCashier').value = D.settings.cashier || '';
   $('#cashierList').innerHTML = D.settings.cashier ? `<option value="${esc(D.settings.cashier)}">` : '';
+  const employeeSelect = $('#posEmployee');
+  if (employeeSelect){
+    const current = employeeSelect.value;
+    employeeSelect.innerHTML = '<option value="">未指定员工</option>' +
+      (D.employees || []).filter(e => e.active !== false && e.active !== 0)
+        .map(e => `<option value="${e.id}">${esc(e.name)}（${esc(e.username)}）</option>`).join('');
+    employeeSelect.value = current;
+  }
   renderProductGrid();
   renderCart();
 }
@@ -263,7 +307,8 @@ async function settle(){
         manualDiscount,
         payMethod,
         cashReceived: parseFloat(cashReceived) || null,
-        cashier: ($('#posCashier').value || '').trim() || D.settings.cashier
+        cashier: ($('#posCashier').value || '').trim() || D.settings.cashier,
+        employeeId: parseInt($('#posEmployee').value, 10) || null
       }
     });
     await refresh();
@@ -283,7 +328,7 @@ function showReceipt(sale){
       <div class="r-head">
         <div class="shop">${esc(D.settings.shopName)}</div>
         <p>单号：${esc(sale.no)}</p>
-        <p>${fmtDT(sale.time)}　收银员：${esc(D.settings.cashier)}</p>
+        <p>${fmtDT(sale.time)}　员工：${esc(sale.employeeName || sale.cashier || D.settings.cashier)}</p>
       </div>
       <div class="r-items">${items}</div>
       <div class="r-line"><span>小计</span><span>${money(sale.subtotal)}</span></div>
@@ -499,19 +544,107 @@ function renderMembers(){
 }
 
 /* ============================================================
+ * 员工管理与登录
+ * ============================================================ */
+let editingEmployeeId = null;
+function employeeFormOpen(id){
+  editingEmployeeId = id ? Number(id) : null;
+  const e = editingEmployeeId ? (D.employees || []).find(x => x.id === editingEmployeeId) : null;
+  $('#employeeModalTitle').textContent = e ? '编辑员工' : '新增员工';
+  $('#employeeUsername').value = e ? e.username : '';
+  $('#employeeUsername').disabled = !!e;
+  $('#employeeName').value = e ? e.name : '';
+  $('#employeePassword').value = '';
+  $('#employeePassword').placeholder = e ? '留空表示不修改密码' : '至少 6 位';
+  $('#employeeActive').checked = e ? !!e.active : true;
+  openModal('employeeModal');
+}
+async function saveEmployee(){
+  const username = $('#employeeUsername').value.trim();
+  const name = $('#employeeName').value.trim();
+  const password = $('#employeePassword').value;
+  const active = $('#employeeActive').checked;
+  if (!name){ alert('请输入员工姓名'); return; }
+  if (!editingEmployeeId && !username){ alert('请输入登录账号'); return; }
+  if (!editingEmployeeId && password.length < 6){ alert('密码至少需要 6 位'); return; }
+  try {
+    const body = { username, name, active };
+    if (password) body.password = password;
+    if (editingEmployeeId) await api('/employees/' + editingEmployeeId, { method: 'PUT', body });
+    else await api('/employees', { method: 'POST', body });
+    await refresh(); closeModal('employeeModal'); renderEmployees();
+  } catch (e){ alert('保存失败：' + e.message); }
+}
+async function delEmployee(id){
+  const e = (D.employees || []).find(x => x.id === Number(id));
+  if (!e || !confirm(`确定删除员工「${e.name}」？历史记录不会被删除。`)) return;
+  try {
+    await api('/employees/' + Number(id), { method: 'DELETE' });
+    await refresh(); renderEmployees();
+  } catch (err){ alert('删除失败：' + err.message); }
+}
+function renderEmployees(){
+  const list = D.employees || [];
+  $('#employeeTbody').innerHTML = list.length ? list.map(e => `
+    <tr>
+      <td><b>${esc(e.name)}</b></td>
+      <td>${esc(e.username)}</td>
+      <td><span class="badge ${e.active ? 'b-green' : 'b-gray'}">${e.active ? '启用' : '停用'}</span></td>
+      <td>${fmtD(e.created_at || e.createdAt)}</td>
+      <td><button class="btn small" onclick="employeeFormOpen('${e.id}')">编辑</button>
+          <button class="btn small danger" onclick="delEmployee('${e.id}')">删除</button></td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty">暂无员工</td></tr>';
+}
+function showEmployeeLogin(){
+  $('#loginOverlay').classList.add('show');
+  $('#loginError').textContent = '';
+  setTimeout(() => $('#loginUsername').focus(), 0);
+}
+async function loginEmployee(){
+  const username = $('#loginUsername').value.trim();
+  const password = $('#loginPassword').value;
+  const error = $('#loginError');
+  const button = $('#loginOverlay button');
+  if (!username || !password){ error.textContent = '请输入账号和密码'; return; }
+  button.disabled = true;
+  error.textContent = '';
+  try {
+    await api('/login', { method: 'POST', body: { username, password } });
+    await refresh();
+    $('#loginOverlay').classList.remove('show');
+    $('#loginPassword').value = '';
+    await switchView('pos');
+  } catch (e){
+    error.textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+async function logoutEmployee(){
+  try { await api('/logout', { method: 'POST' }); } finally { window.location.reload(); }
+}
+
+/* ============================================================
  * 出账记账
  * ============================================================ */
 let editingExpenseId = null;
 let expFilter = { cat: '全部', from: '', to: '' };
 
 function expenseFormOpen(id){
-  editingExpenseId = id || null;
-  const e = id ? ALL_EXPENSES.find(x => x.id === id) : null;
+  editingExpenseId = id ? Number(id) : null;
+  const e = editingExpenseId ? ALL_EXPENSES.find(x => x.id === editingExpenseId) : null;
   $('#expenseModalTitle').textContent = e ? '编辑出账' : '新增出账';
   $('#efDate').value = e ? fmtD(e.time) : todayStr();
   $('#efCat').value = e ? e.category : '进货';
   $('#efAmount').value = e ? e.amount : '';
   $('#efNote').value = e ? e.note : '';
+  const employeeSelect = $('#efEmployee');
+  if (employeeSelect){
+    employeeSelect.innerHTML = '<option value="">未指定员工</option>' +
+      (D.employees || []).filter(x => x.active !== false && x.active !== 0)
+        .map(x => `<option value="${x.id}">${esc(x.name)}（${esc(x.username)}）</option>`).join('');
+    employeeSelect.value = e && e.employee_id ? String(e.employee_id) : '';
+  }
   openModal('expenseModal');
 }
 async function saveExpense(){
@@ -521,7 +654,7 @@ async function saveExpense(){
   if (!date){ alert('请选择日期'); return; }
   if (!cat){ alert('请输入类别'); return; }
   if (isNaN(amount) || amount <= 0){ alert('请输入正确的金额（大于 0）'); return; }
-  const body = { date, category: cat, amount: round2(amount), note: $('#efNote').value.trim() };
+  const body = { date, category: cat, amount: round2(amount), note: $('#efNote').value.trim(), employeeId: parseInt($('#efEmployee').value, 10) || null };
   try {
     if (editingExpenseId) await api('/expenses/' + editingExpenseId, { method: 'PUT', body });
     else await api('/expenses', { method: 'POST', body });
@@ -529,7 +662,7 @@ async function saveExpense(){
   } catch (e){ alert('保存失败：' + e.message); }
 }
 async function delExpense(id){
-  const e = ALL_EXPENSES.find(x => x.id === id);
+  const e = ALL_EXPENSES.find(x => x.id === Number(id));
   if (!e) return;
   if (!confirm(`确定删除该笔出账（${e.category} ${money(e.amount)}）？`)) return;
   try {
@@ -539,6 +672,19 @@ async function delExpense(id){
 }
 let ALL_EXPENSES = [];
 async function renderExpenses(){
+  const mobile = DEVICE === 'mobile';
+  const history = $('#expenseHistory');
+  const historyTools = $('#expenseHistoryTools');
+  const addButton = $('#expenseAddBtn');
+  if (mobile){
+    if (history) history.style.display = 'none';
+    if (historyTools) historyTools.style.display = 'none';
+    if (addButton) addButton.textContent = '＋ 记录支出';
+    return;
+  }
+  if (history) history.style.display = '';
+  if (historyTools) historyTools.style.display = 'contents';
+  if (addButton) addButton.textContent = '＋ 新增出账';
   ALL_EXPENSES = await api('/expenses');
   const list = ALL_EXPENSES.filter(e =>
     (expFilter.cat === '全部' || e.category === expFilter.cat) &&
@@ -550,9 +696,10 @@ async function renderExpenses(){
       <td><span class="badge b-red">${esc(e.category)}</span></td>
       <td class="num"><b style="color:var(--danger)">${money(e.amount)}</b></td>
       <td style="color:var(--muted)">${esc(e.note || '-')}</td>
+      <td>${esc(e.employee_name || '未绑定')}</td>
       <td>${admin ? `<button class="btn small" onclick="expenseFormOpen('${e.id}')">编辑</button>
           <button class="btn small danger" onclick="delExpense('${e.id}')">删除</button>` : '<span style="color:var(--muted);font-size:12px">手机端只读</span>'}</td>
-    </tr>`).join('') : '<tr><td colspan="5" class="empty">该条件下暂无出账记录</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">该条件下暂无出账记录</td></tr>';
   $('#expTotal').textContent = money(list.reduce((a, e) => a + e.amount, 0));
 }
 
@@ -570,7 +717,8 @@ async function renderLedger(){
     rows.push({
       time: s.time, no: s.no, kind: 'in', badge: 'b-green', badgeText: '销售',
       summary: `${esc(first ? first.name : '')} ×${first ? first.qty : ''}${more}`,
-      amount: s.payable, note: s.memberName ? `${s.memberName}（${s.memberLevel}）` : (s.pay_method || '')
+      amount: s.payable, employee: s.employee_name || s.cashier || '未绑定',
+      note: s.memberName ? `${s.memberName}（${s.memberLevel}）` : (s.pay_method || '')
     });
   });
   expenses.forEach(e => {
@@ -578,7 +726,7 @@ async function renderLedger(){
     rows.push({
       time: e.time, no: 'ZC-' + e.id, kind: 'out', badge: 'b-red', badgeText: '出账',
       summary: `${esc(e.category)} 支出`,
-      amount: -e.amount, note: esc(e.note || '')
+      amount: -e.amount, employee: e.employee_name || '未绑定', note: esc(e.note || '')
     });
   });
   const list = rows.filter(r => inRange(r.time, ledgerFilter.from, ledgerFilter.to)).sort((a, b) => b.time - a.time);
@@ -589,8 +737,9 @@ async function renderLedger(){
       <td><span class="badge ${r.badge}">${r.badgeText}</span> <span style="font-size:12px;color:var(--muted)">${esc(r.no)}</span></td>
       <td>${r.summary}</td>
       <td class="num" style="color:${r.kind === 'in' ? 'var(--ok)' : 'var(--danger)'};font-weight:600">${r.amount >= 0 ? '+' : '-'}${money(Math.abs(r.amount))}</td>
+      <td>${esc(r.employee)}</td>
       <td style="color:var(--muted)">${r.note || '-'}</td>
-    </tr>`).join('') : '<tr><td colspan="5" class="empty">该条件下暂无流水</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">该条件下暂无流水</td></tr>';
 
   const sumIn = round2(list.filter(r => r.kind === 'in').reduce((a, r) => a + r.amount, 0));
   const sumOut = round2(list.filter(r => r.kind === 'out').reduce((a, r) => a + Math.abs(r.amount), 0));
@@ -957,7 +1106,11 @@ async function sendChat(){
     statsRange = { from: todayStr(), to: todayStr() };
     $('#stFrom').value = statsRange.from;
     $('#stTo').value = statsRange.to;
-    switchView('home');
+    if (DEVICE === 'mobile' && !D.employee){
+      showEmployeeLogin();
+      return;
+    }
+    await switchView(DEVICE === 'mobile' ? 'pos' : 'home');
   } catch (e){
     document.body.innerHTML = `<div style="padding:60px;text-align:center;font-family:sans-serif">
       <h2>⚠️ 无法连接服务器</h2>

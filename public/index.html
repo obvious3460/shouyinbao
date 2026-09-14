@@ -30,6 +30,9 @@
   .topbar{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:8px; }
   .topbar h1{ font-size:20px; }
   .topbar .date{ color:var(--muted); font-size:13px; }
+  .topbar-right{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:flex-end; }
+  .employee-status{ display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+  .employee-status .logout{ border:none; background:transparent; color:var(--accent); padding:0; font-size:12px; }
   .view{ display:none; }
   .card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
   .card h3{ font-size:15px; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
@@ -122,6 +125,14 @@
   .modal-box h3{ margin-bottom:16px; }
   .modal-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
 
+  /* ---------- 员工登录 ---------- */
+  .login-overlay{ display:none; position:fixed; inset:0; z-index:100; background:rgba(15,23,42,.55); align-items:center; justify-content:center; padding:20px; }
+  .login-overlay.show{ display:flex; }
+  .login-box{ width:100%; max-width:360px; background:#fff; border-radius:16px; padding:24px; box-shadow:0 18px 50px rgba(15,23,42,.25); }
+  .login-box h2{ font-size:20px; margin-bottom:6px; }
+  .login-box .login-sub{ color:var(--muted); font-size:13px; margin-bottom:18px; line-height:1.6; }
+  .login-box .login-error{ min-height:20px; color:var(--danger); font-size:12px; margin-top:8px; }
+
   /* ---------- 小票 ---------- */
   .receipt{ font-family:"Courier New",monospace; background:#fff; }
   .receipt .r-head{ text-align:center; margin-bottom:8px; }
@@ -191,6 +202,21 @@
     #reportPrintArea{ display:block !important; position:fixed; left:0; top:0; width:100%; }
     .sidebar,main,.modal{ display:none !important; }
   }
+  @media (max-width:700px){
+    body{ display:block; padding-bottom:68px; }
+    main{ padding:12px 12px 20px; }
+    .sidebar{ position:fixed; z-index:40; left:0; right:0; bottom:0; top:auto; width:100%; height:64px; flex-direction:row; border-top:1px solid #1e293b; }
+    .sidebar .logo,.sidebar .device-tag,.sidebar .sidebar-foot{ display:none; }
+    .sidebar nav{ display:flex; flex:1; width:100%; }
+    .nav-item{ flex:1; padding:8px 4px 7px; text-align:center; font-size:12px; border-left:none; border-top:3px solid transparent; }
+    .nav-item.active{ border-left:none; border-top-color:var(--accent); }
+    .topbar{ margin-bottom:12px; }
+    .topbar h1{ font-size:18px; }
+    .topbar-right{ gap:6px; }
+    .employee-status{ font-size:11px; }
+    .pos-wrap{ gap:12px; }
+    .cart-box{ position:static; }
+  }
 </style>
 </head>
 <body>
@@ -205,6 +231,7 @@
     <div class="nav-item" data-view="stock" onclick="switchView('stock')">📦 出库入库</div>
     <div class="nav-item admin-only" data-view="products" onclick="switchView('products')">📋 商品管理</div>
     <div class="nav-item admin-only" data-view="members" onclick="switchView('members')">👤 会员管理</div>
+    <div class="nav-item admin-only" data-view="employees" onclick="switchView('employees')">👷 员工管理</div>
     <div class="nav-item" data-view="expenses" onclick="switchView('expenses')">💸 出账记账</div>
     <div class="nav-item" data-view="ledger" onclick="switchView('ledger')">📒 流水账本</div>
     <div class="nav-item" data-view="stats" onclick="switchView('stats')">📈 统计分析</div>
@@ -219,7 +246,10 @@
 <main>
   <div class="topbar">
     <h1 id="pageTitle">📊 今日概览</h1>
-    <div class="date" id="todayLabel"></div>
+    <div class="topbar-right">
+      <div class="date" id="todayLabel"></div>
+      <div id="employeeStatus"></div>
+    </div>
   </div>
 
   <!-- 首页 -->
@@ -288,7 +318,8 @@
         </div>
 
         <button class="btn primary big" style="width:100%;margin-top:6px" onclick="settle()">💵 结算收款</button>
-        <label class="field" style="margin-top:10px">收银员（记录到销售单，AI 可查员工工作记录）<input type="text" id="posCashier" list="cashierList" placeholder="默认收银员"></label>
+        <label class="field" id="posEmployeeRow" style="margin-top:10px">绑定员工（电脑端可选）<select id="posEmployee"></select></label>
+        <label class="field" id="posCashierRow">收银员备注（未选择员工时使用）<input type="text" id="posCashier" list="cashierList" placeholder="默认收银员"></label>
       </div>
     </div>
   </section>
@@ -363,31 +394,51 @@
     </div>
   </section>
 
+  <!-- 员工管理（电脑端） -->
+  <section id="view-employees" class="view">
+    <div class="card">
+      <h3>👷 员工管理 <span class="hint">员工登录后，手机新增的销售和支出会自动绑定到该员工</span></h3>
+      <div class="toolbar">
+        <div class="spacer"></div>
+        <button class="btn primary" onclick="employeeFormOpen(null)">＋ 新增员工</button>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>姓名</th><th>登录账号</th><th>状态</th><th>创建日期</th><th style="width:150px">操作</th></tr></thead>
+        <tbody id="employeeTbody"></tbody>
+      </table>
+      <p style="font-size:12px;color:var(--muted);margin-top:12px">首次启动默认账号：employee / 123456。建议登录后立即修改密码。</p>
+    </div>
+  </section>
+
   <!-- 出账记账 -->
   <section id="view-expenses" class="view">
     <div class="card">
-      <h3>💸 出账记账 <span class="hint">记录进货、房租、水电、工资等支出（手机端可新增，编辑删除请在电脑端）</span></h3>
+      <h3>💸 出账记账 <span class="hint">记录进货、房租、水电、工资等支出；手机端仅可新增，电脑端可查看和管理</span></h3>
       <div class="toolbar">
-        <select id="expCat" onchange="expFilter.cat=this.value;renderExpenses()">
-          <option value="全部">全部类别</option>
-          <option value="进货">进货</option>
-          <option value="房租">房租</option>
-          <option value="水电">水电</option>
-          <option value="工资">工资</option>
-          <option value="设备">设备</option>
-          <option value="其他">其他</option>
-        </select>
-        <input type="date" id="expFrom" onchange="expFilter.from=this.value;renderExpenses()">
-        <span style="color:var(--muted)">至</span>
-        <input type="date" id="expTo" onchange="expFilter.to=this.value;renderExpenses()">
-        <div class="spacer"></div>
-        <div class="stat-card" style="padding:6px 14px;border-radius:8px"><span style="font-size:12px;color:var(--muted)">筛选合计：</span><b id="expTotal" style="color:var(--danger)">¥0.00</b></div>
-        <button class="btn primary" onclick="expenseFormOpen(null)">＋ 新增出账</button>
+        <div id="expenseHistoryTools" style="display:contents">
+          <select id="expCat" onchange="expFilter.cat=this.value;renderExpenses()">
+            <option value="全部">全部类别</option>
+            <option value="进货">进货</option>
+            <option value="房租">房租</option>
+            <option value="水电">水电</option>
+            <option value="工资">工资</option>
+            <option value="设备">设备</option>
+            <option value="其他">其他</option>
+          </select>
+          <input type="date" id="expFrom" onchange="expFilter.from=this.value;renderExpenses()">
+          <span style="color:var(--muted)">至</span>
+          <input type="date" id="expTo" onchange="expFilter.to=this.value;renderExpenses()">
+          <div class="spacer"></div>
+          <div class="stat-card" style="padding:6px 14px;border-radius:8px"><span style="font-size:12px;color:var(--muted)">筛选合计：</span><b id="expTotal" style="color:var(--danger)">¥0.00</b></div>
+        </div>
+        <button id="expenseAddBtn" class="btn primary" onclick="expenseFormOpen(null)">＋ 新增出账</button>
       </div>
-      <table class="tbl">
-        <thead><tr><th>日期</th><th>类别</th><th class="num">金额</th><th>备注</th><th style="width:110px">操作</th></tr></thead>
-        <tbody id="expTbody"></tbody>
-      </table>
+      <div id="expenseHistory">
+        <table class="tbl">
+          <thead><tr><th>日期</th><th>类别</th><th class="num">金额</th><th>备注</th><th>员工</th><th style="width:110px">操作</th></tr></thead>
+          <tbody id="expTbody"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -408,7 +459,7 @@
         <span style="font-size:13px;color:var(--muted)">收入 <b style="color:var(--ok)" id="ledSumIn">¥0.00</b>　支出 <b style="color:var(--danger)" id="ledSumOut">¥0.00</b>　净额 <b id="ledSumNet">¥0.00</b></span>
       </div>
       <table class="tbl">
-        <thead><tr><th>时间</th><th>单号 / 类型</th><th>摘要</th><th class="num">金额</th><th>备注</th></tr></thead>
+        <thead><tr><th>时间</th><th>单号 / 类型</th><th>摘要</th><th class="num">金额</th><th>员工</th><th>备注</th></tr></thead>
         <tbody id="ledTbody"></tbody>
       </table>
     </div>
@@ -592,6 +643,21 @@
   </div>
 </div>
 
+<!-- 员工弹窗 -->
+<div class="modal" id="employeeModal">
+  <div class="modal-box">
+    <h3 id="employeeModalTitle">新增员工</h3>
+    <label class="field">登录账号 *<input type="text" id="employeeUsername" placeholder="字母、数字或中文账号"></label>
+    <label class="field">员工姓名 *<input type="text" id="employeeName" placeholder="如：李娜"></label>
+    <label class="field">登录密码 *<input type="password" id="employeePassword" autocomplete="new-password" placeholder="至少 6 位"></label>
+    <label class="field" style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="employeeActive" checked style="width:auto"> 启用账号</label>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('employeeModal')">取消</button>
+      <button class="btn primary" onclick="saveEmployee()">保存</button>
+    </div>
+  </div>
+</div>
+
 <!-- 出账弹窗 -->
 <div class="modal" id="expenseModal">
   <div class="modal-box">
@@ -602,10 +668,23 @@
       <label class="field">金额（元）*<input type="number" id="efAmount" min="0.01" step="0.01"></label>
     </div>
     <label class="field">备注<input type="text" id="efNote" placeholder="如：本月进可乐 50 箱"></label>
+    <label class="field" id="expenseEmployeeRow">绑定员工（电脑端可选）<select id="efEmployee"></select></label>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('expenseModal')">取消</button>
       <button class="btn primary" onclick="saveExpense()">保存</button>
     </div>
+  </div>
+</div>
+
+<!-- 员工登录 -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h2>员工登录</h2>
+    <p class="login-sub">登录后才能使用手机端记账，销售和支出会自动绑定到当前员工。</p>
+    <label class="field">账号<input type="text" id="loginUsername" autocomplete="username" placeholder="请输入员工账号"></label>
+    <label class="field">密码<input type="password" id="loginPassword" autocomplete="current-password" placeholder="请输入密码" onkeydown="if(event.key==='Enter')loginEmployee()"></label>
+    <button class="btn primary big" style="width:100%" onclick="loginEmployee()">登录</button>
+    <div class="login-error" id="loginError"></div>
   </div>
 </div>
 
