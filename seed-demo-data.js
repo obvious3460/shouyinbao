@@ -40,11 +40,9 @@ const db = new DatabaseSync(DB_FILE);
 db.exec('DELETE FROM sale_items; DELETE FROM sales; DELETE FROM stock_moves; DELETE FROM expenses;');
 db.prepare("INSERT INTO settings (key, value) VALUES ('seq', '1000') ON CONFLICT(key) DO UPDATE SET value='1000'").run();
 
-const products = db.prepare('SELECT * FROM products ORDER BY id').all();
+const products = db.prepare("SELECT * FROM products WHERE kind = 'goods' ORDER BY id").all();
 const levels = db.prepare('SELECT * FROM levels').all();
 let members = db.prepare('SELECT * FROM members').all();
-const settingsRow = db.prepare("SELECT value FROM settings WHERE key='pointsToYuan'").get();
-const pointsToYuan = settingsRow ? parseInt(settingsRow.value, 10) || 100 : 100;
 
 /* ---------- 补充会员并重置积分 ---------- */
 const NEW_MEMBERS = [
@@ -94,7 +92,7 @@ function makeSale(d){
   const manualDiscountAmt = r2(subtotal - afterManual);
 
   // VIP 会员（约35%）
-  let member = null, vipRate = 1, vipDiscount = 0, pointsUsed = 0, pointsValue = 0, pointsEarned = 0;
+  let member = null, vipRate = 1, vipDiscount = 0, pointsEarned = 0;
   if (Math.random() < 0.35){
     member = pick(members);
     vipRate = levelRate(member.level_id);
@@ -102,13 +100,7 @@ function makeSale(d){
   }
   const afterVip = r2(afterManual * vipRate);
 
-  // 积分抵扣（会员约25%的概率用积分）
-  if (member && member.points >= 100 && Math.random() < 0.25){
-    const maxPts = Math.min(member.points, Math.floor(r2(afterVip * 0.5) * pointsToYuan));
-    pointsUsed = maxPts > 0 ? rand(0, maxPts) : 0;
-    pointsValue = r2(pointsUsed / pointsToYuan);
-  }
-  const payable = Math.max(0, r2(afterVip - pointsValue));
+  const payable = afterVip;
   pointsEarned = Math.floor(payable * 1); // 默认 1元=1分
 
   // 支付方式
@@ -129,7 +121,7 @@ function makeSale(d){
       member_id, member_name, member_level, cashier)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(no, time, subtotal, manualRate, manualDiscountAmt, vipRate, vipDiscount,
-      pointsUsed, pointsValue, pointsEarned, payable, payMethod, cashReceived, change,
+      0, 0, pointsEarned, payable, payMethod, cashReceived, change,
       member ? member.id : null, member ? member.name : null, member ? levelName(member.level_id) : null, cashier);
   const saleId = Number(r.lastInsertRowid);
 
@@ -155,7 +147,7 @@ function makeSale(d){
   }
   // 会员积分
   if (member){
-    member.points = Math.max(0, member.points - pointsUsed) + pointsEarned;
+    member.points += pointsEarned;
     db.prepare('UPDATE members SET points = ? WHERE id = ?').run(member.points, member.id);
   }
   totalRevenue += payable;
@@ -209,7 +201,7 @@ for (const [date, pid, qty, note] of restocks){
 const stat = db.prepare(`
   SELECT strftime('%Y-%m', time/1000, 'unixepoch', 'localtime') AS month,
          COUNT(*) AS orders, ROUND(SUM(payable),2) AS revenue,
-         ROUND(SUM(vip_discount + points_value),2) AS vipGive,
+         ROUND(SUM(vip_discount),2) AS vipGive,
          ROUND(SUM(points_earned),0) AS points
   FROM sales GROUP BY month ORDER BY month`).all();
 console.log('\n================ 模拟数据生成完成 ================');

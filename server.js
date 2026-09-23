@@ -53,7 +53,14 @@ CREATE TABLE IF NOT EXISTS products (
   price    REAL NOT NULL DEFAULT 0,
   cost     REAL NOT NULL DEFAULT 0,
   stock    REAL NOT NULL DEFAULT 0,
-  unit     TEXT DEFAULT ''
+  unit     TEXT DEFAULT '',
+  kind     TEXT NOT NULL DEFAULT 'goods'
+);
+CREATE TABLE IF NOT EXISTS service_materials (
+  service_id  INTEGER NOT NULL,
+  material_id INTEGER NOT NULL,
+  qty         REAL NOT NULL,
+  PRIMARY KEY (service_id, material_id)
 );
 CREATE TABLE IF NOT EXISTS members (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +130,12 @@ CREATE TABLE IF NOT EXISTS stock_moves (
 );
 `);
 
+/* 迁移：旧商品默认作为实物商品 */
+try {
+  const cols = db.prepare('PRAGMA table_info(products)').all().map(c => c.name);
+  if (!cols.includes('kind')) db.exec("ALTER TABLE products ADD COLUMN kind TEXT NOT NULL DEFAULT 'goods'");
+} catch (e) { console.warn('[迁移] products.kind 列添加失败：', e.message); }
+
 /* 迁移：为历史数据库补充 sales.cashier 列 */
 try {
   const cols = db.prepare('PRAGMA table_info(sales)').all().map(c => c.name);
@@ -190,15 +203,15 @@ ensureDefaultEmployee();
 
 /* ---------- 设置 ---------- */
 const SETTING_DEFAULTS = {
-  shopName: '收银宝便利店', cashier: '收银员', pointsPerYuan: 1, pointsToYuan: 100, lowStock: 10,
+  shopName: '收银宝便利店', cashier: '收银员', pointsPerYuan: 1, lowStock: 10,
   aiProvider: 'demo', aiBaseUrl: 'https://api.deepseek.com', aiKey: '', aiModel: 'deepseek-chat'
 };
 function getSettings(){
   const out = { ...SETTING_DEFAULTS };
   for (const row of db.prepare('SELECT key, value FROM settings').all()) out[row.key] = row.value;
   out.pointsPerYuan = parseFloat(out.pointsPerYuan) || 0;
-  out.pointsToYuan = parseInt(out.pointsToYuan, 10) || 100;
   out.lowStock = parseInt(out.lowStock, 10) || 10;
+  delete out.pointsToYuan;
   if (!out.aiProvider) out.aiProvider = 'demo';
   delete out.seq;
   return out;
@@ -305,14 +318,38 @@ function requireMobileEmployee(req, res){
 }
 
 /* ---------- 折扣计算（与前端一致，服务端为准） ---------- */
-function calcSale(items, member, pointsUse, manualDiscount, settings){
+function calcSale(items, member, manualDiscount, settings){
+  const stockUse = new Map();
   const rows = items.map(it => {
     const p = db.prepare('SELECT * FROM products WHERE id = ?').get(it.productId);
     if (!p) throw new Error('商品不存在（id=' + it.productId + '）');
-    const qty = Math.max(0.001, num(it.qty, 1));
-    if (p.stock >= 0 && qty > p.stock) throw new Error(`「${p.name}」库存不足（剩余 ${p.stock}）`);
-    return { ...p, qty };
+    if (p.kind === 'supply') throw new Error(`「${p.name}」是耗材，不能直接销售`);
+    const qty = Number(it.qty);
+    if (!Number.isFinite(qty) || qty <= 0) throw new Error(`「${p.name}」数量不正确`);
+    let cost = p.cost;
+    if (p.kind === 'service'){
+      const materials = db.prepare('SELECT m.qty, p.* FROM service_materials m JOIN products p ON p.id = m.material_id WHERE m.service_id = ?').all(p.id);
+      for (const material of materials){
+        if (material.kind === 'service') throw new Error(`「${p.name}」的耗材配置无效`);
+        cost += material.cost * material.qty;
+        const use = stockUse.get(material.id) || { product: material, qty: 0, serviceQty: 0 };
+        use.qty += material.qty * qty;
+        use.serviceQty += material.qty * qty;
+        stockUse.set(material.id, use);
+      }
+    } else {
+      const use = stockUse.get(p.id) || { product: p, qty: 0, serviceQty: 0 };
+      use.qty += qty;
+      stockUse.set(p.id, use);
+    }
+    return { ...p, cost: r2(cost), qty };
   });
+  for (const use of stockUse.values()){
+    if (!Number.isFinite(use.qty)) throw new Error('耗材用量超出范围');
+    if (use.product.stock >= 0 && use.qty > use.product.stock + 0.000001){
+      throw new Error(`「${use.product.name}」库存不足（需要 ${Math.round(use.qty * 1000) / 1000}，剩余 ${use.product.stock}）`);
+    }
+  }
   const subtotal = r2(rows.reduce((a, r) => a + r.price * r.qty, 0));
   const manualRate = Math.min(100, Math.max(1, num(manualDiscount, 100))) / 100;
   const afterManual = r2(subtotal * manualRate);
@@ -320,15 +357,9 @@ function calcSale(items, member, pointsUse, manualDiscount, settings){
   const rate = member ? (db.prepare('SELECT rate FROM levels WHERE id = ?').get(member.level_id) || {}).rate || 1 : 1;
   const vipDiscount = r2(afterManual - afterManual * rate);
   const afterVip = r2(afterManual * rate);
-  let pu = Math.max(0, Math.floor(num(pointsUse, 0)));
-  if (member) pu = Math.min(pu, member.points);
-  const maxPointsValue = r2(afterVip * 0.5);
-  const maxPoints = Math.floor(maxPointsValue * settings.pointsToYuan);
-  pu = Math.min(pu, maxPoints);
-  const pointsValue = r2(pu / settings.pointsToYuan);
-  const payable = Math.max(0, r2(afterVip - pointsValue));
+  const payable = afterVip;
   const pointsEarned = Math.floor(payable * settings.pointsPerYuan);
-  return { rows, subtotal, manualRate, manualDiscountAmt, vipRate: rate, vipDiscount, pointsUsed: pu, pointsValue, payable, pointsEarned, afterVip };
+  return { rows, stockUse, subtotal, manualRate, manualDiscountAmt, vipRate: rate, vipDiscount, pointsUsed: 0, pointsValue: 0, payable, pointsEarned, afterVip };
 }
 
 /* ---------- API 路由 ---------- */
@@ -366,6 +397,7 @@ route('GET', '/api/bootstrap', async (req, res) => {
     settings: getSettings(),
     levels: db.prepare('SELECT * FROM levels ORDER BY id').all(),
     products: db.prepare('SELECT * FROM products ORDER BY id').all(),
+    serviceMaterials: db.prepare('SELECT service_id serviceId, material_id materialId, qty FROM service_materials ORDER BY service_id, material_id').all(),
     members: db.prepare('SELECT * FROM members ORDER BY id').all(),
     employees: mobile ? [] : db.prepare('SELECT id, username, name, active, created_at FROM employees ORDER BY id').all(),
     employee: publicEmployee(employee),
@@ -380,7 +412,6 @@ route('PUT', '/api/settings', async (req, res) => {
   setSetting('shopName', String(b.shopName || '收银宝便利店'));
   setSetting('cashier', String(b.cashier || '收银员'));
   setSetting('pointsPerYuan', num(b.pointsPerYuan, 1));
-  setSetting('pointsToYuan', Math.max(1, parseInt(b.pointsToYuan, 10) || 100));
   setSetting('lowStock', Math.max(0, parseInt(b.lowStock, 10) || 10));
   setSetting('aiProvider', String(b.aiProvider || 'demo'));
   setSetting('aiBaseUrl', String(b.aiBaseUrl || 'https://api.deepseek.com'));
@@ -390,13 +421,13 @@ route('PUT', '/api/settings', async (req, res) => {
 }, { desktopOnly: true });
 
 route('POST', '/api/reset-sample', async (req, res) => {
-  db.exec('DELETE FROM sale_items; DELETE FROM sales; DELETE FROM stock_moves; DELETE FROM expenses; DELETE FROM members; DELETE FROM products; DELETE FROM levels; DELETE FROM settings;');
+  db.exec('DELETE FROM service_materials; DELETE FROM sale_items; DELETE FROM sales; DELETE FROM stock_moves; DELETE FROM expenses; DELETE FROM members; DELETE FROM products; DELETE FROM levels; DELETE FROM settings;');
   seedIfEmpty();
   json(res, 200, { ok: true });
 }, { desktopOnly: true });
 
 route('POST', '/api/clear', async (req, res) => {
-  db.exec('DELETE FROM sale_items; DELETE FROM sales; DELETE FROM stock_moves; DELETE FROM expenses; DELETE FROM members; DELETE FROM products; DELETE FROM levels; DELETE FROM settings;');
+  db.exec('DELETE FROM service_materials; DELETE FROM sale_items; DELETE FROM sales; DELETE FROM stock_moves; DELETE FROM expenses; DELETE FROM members; DELETE FROM products; DELETE FROM levels; DELETE FROM settings;');
   setSetting('seq', 1000);
   json(res, 200, { ok: true });
 }, { desktopOnly: true });
@@ -443,25 +474,77 @@ route('DELETE', '/api/employees/:id', async (req, res, p) => {
 }, { desktopOnly: true });
 
 /* --- 商品 --- */
+function productInput(b, existingId){
+  const name = String(b.name || '').trim();
+  if (!name) throw new Error('名称不能为空');
+  const kind = b.kind || 'goods';
+  if (!['goods', 'service', 'supply'].includes(kind)) throw new Error('项目类型不正确');
+  const price = Number(b.price);
+  const cost = Number(b.cost || 0);
+  const stock = kind === 'service' ? -1 : Number(b.stock);
+  if (![price, cost, stock].every(Number.isFinite) || price < 0 || cost < 0 || stock < -1) throw new Error('价格、成本或库存不正确');
+  if (existingId && kind === 'service' && db.prepare('SELECT 1 FROM service_materials WHERE material_id = ?').get(existingId)){
+    throw new Error('该项目已被服务作为耗材使用，不能改为服务');
+  }
+  const materials = [];
+  const seen = new Set();
+  if (kind === 'service'){
+    if (!Array.isArray(b.materials || [])) throw new Error('耗材配置不正确');
+    for (const item of b.materials || []){
+      const materialId = Number(item.materialId);
+      const qty = Number(item.qty);
+      const material = db.prepare('SELECT id, kind FROM products WHERE id = ?').get(materialId);
+      if (!material || material.kind === 'service' || materialId === existingId || seen.has(materialId) || !Number.isFinite(qty) || qty <= 0 || qty > 1000000){
+        throw new Error('耗材项目或用量不正确');
+      }
+      seen.add(materialId);
+      materials.push({ materialId, qty });
+    }
+  }
+  return { name, kind, category: String(b.category || '').trim() || '未分类', price: r2(price), cost: r2(cost), stock,
+    unit: String(b.unit || '').trim(), materials };
+}
+function writeMaterials(serviceId, materials){
+  db.prepare('DELETE FROM service_materials WHERE service_id = ?').run(serviceId);
+  const insert = db.prepare('INSERT INTO service_materials (service_id, material_id, qty) VALUES (?, ?, ?)');
+  for (const material of materials) insert.run(serviceId, material.materialId, material.qty);
+}
 route('GET', '/api/products', async (req, res) => json(res, 200, db.prepare('SELECT * FROM products ORDER BY id').all()), { desktopOnly: true });
 route('POST', '/api/products', async (req, res) => {
   const b = await readBody(req);
-  const name = String(b.name || '').trim();
-  if (!name) return json(res, 400, { error: '商品名称不能为空' });
-  const r = db.prepare('INSERT INTO products (name, category, price, cost, stock, unit) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(name, String(b.category || '').trim() || '未分类', r2(num(b.price, 0)), r2(num(b.cost, 0)), num(b.stock, 0), String(b.unit || '').trim());
-  json(res, 200, { id: Number(r.lastInsertRowid) });
+  let input;
+  try { input = productInput(b, null); } catch (e){ return json(res, 400, { error: e.message }); }
+  db.exec('BEGIN');
+  try {
+    const r = db.prepare('INSERT INTO products (name, category, price, cost, stock, unit, kind) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(input.name, input.category, input.price, input.cost, input.stock, input.unit, input.kind);
+    const id = Number(r.lastInsertRowid);
+    writeMaterials(id, input.materials);
+    db.exec('COMMIT');
+    json(res, 200, { id });
+  } catch (e){ db.exec('ROLLBACK'); throw e; }
 }, { desktopOnly: true });
 route('PUT', '/api/products/:id', async (req, res, p) => {
   const b = await readBody(req);
-  const name = String(b.name || '').trim();
-  if (!name) return json(res, 400, { error: '商品名称不能为空' });
-  db.prepare('UPDATE products SET name=?, category=?, price=?, cost=?, stock=?, unit=? WHERE id=?')
-    .run(name, String(b.category || '').trim() || '未分类', r2(num(b.price, 0)), r2(num(b.cost, 0)), num(b.stock, 0), String(b.unit || '').trim(), parseInt(p.id, 10));
-  json(res, 200, { ok: true });
+  const id = parseInt(p.id, 10);
+  const old = db.prepare('SELECT * FROM products WHERE id = ?').get(id);
+  if (!old) return json(res, 404, { error: '项目不存在' });
+  let input;
+  try { input = productInput({ ...b, kind: b.kind || old.kind }, id); } catch (e){ return json(res, 400, { error: e.message }); }
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE products SET name=?, category=?, price=?, cost=?, stock=?, unit=?, kind=? WHERE id=?')
+      .run(input.name, input.category, input.price, input.cost, input.stock, input.unit, input.kind, id);
+    writeMaterials(id, input.materials);
+    db.exec('COMMIT');
+    json(res, 200, { ok: true });
+  } catch (e){ db.exec('ROLLBACK'); throw e; }
 }, { desktopOnly: true });
 route('DELETE', '/api/products/:id', async (req, res, p) => {
-  db.prepare('DELETE FROM products WHERE id = ?').run(parseInt(p.id, 10));
+  const id = parseInt(p.id, 10);
+  if (db.prepare('SELECT 1 FROM service_materials WHERE material_id = ?').get(id)) return json(res, 400, { error: '该项目正被服务作为耗材使用，请先修改服务配置' });
+  db.prepare('DELETE FROM service_materials WHERE service_id = ?').run(id);
+  db.prepare('DELETE FROM products WHERE id = ?').run(id);
   json(res, 200, { ok: true });
 }, { desktopOnly: true });
 
@@ -565,7 +648,7 @@ route('POST', '/api/sales', async (req, res) => {
     employee = signedIn || employeeForRecord(req, b);
     cashier = employee ? employee.name : String(b.cashier || settings.cashier || '').trim();
     member = b.memberId ? db.prepare('SELECT * FROM members WHERE id = ?').get(parseInt(b.memberId, 10)) : null;
-    s = calcSale(b.items, member, b.pointsUse, b.manualDiscount, settings);
+    s = calcSale(b.items, member, b.manualDiscount, settings);
     payMethod = String(b.payMethod || '微信');
     cashReceived = null; change = null;
     if (payMethod === '现金'){
@@ -596,14 +679,17 @@ route('POST', '/api/sales', async (req, res) => {
     const updStock = db.prepare('UPDATE products SET stock = ? WHERE id = ?');
     for (const row of s.rows){
       insItem.run(saleId, row.id, row.name, row.category, row.price, row.cost, row.qty);
-      if (row.stock >= 0){
-        const left = Math.max(0, r2(row.stock - row.qty));
-        updStock.run(left, row.id);
-      }
+    }
+    const insMove = db.prepare('INSERT INTO stock_moves (time, product_id, type, qty, note) VALUES (?, ?, ?, ?, ?)');
+    for (const use of s.stockUse.values()){
+      if (use.product.stock < 0) continue;
+      const left = Math.max(0, Math.round((use.product.stock - use.qty) * 1000) / 1000);
+      updStock.run(left, use.product.id);
+      if (use.serviceQty) insMove.run(time, use.product.id, 'out', Math.round(use.serviceQty * 1000) / 1000, '服务消耗 · ' + no);
     }
     if (member){
       db.prepare('UPDATE members SET points = ? WHERE id = ?')
-        .run(Math.max(0, member.points - s.pointsUsed) + s.pointsEarned, member.id);
+        .run(member.points + s.pointsEarned, member.id);
     }
     db.exec('COMMIT');
     json(res, 200, {
@@ -653,6 +739,7 @@ route('POST', '/api/stock', async (req, res) => {
   if (!pid || qty <= 0) return json(res, 400, { error: '请选择商品并填写正确的数量' });
   const p = db.prepare('SELECT * FROM products WHERE id = ?').get(pid);
   if (!p) return json(res, 400, { error: '商品不存在' });
+  if (p.kind === 'service') return json(res, 400, { error: '服务项目没有库存' });
   db.exec('BEGIN');
   try {
     let newStock;
@@ -686,7 +773,7 @@ route('GET', '/api/dashboard', async (req, res) => {
   const revenue = r2(saleRows.reduce((a, s) => a + s.payable, 0));
   const expense = r2(expRows.reduce((a, e) => a + e.amount, 0));
   const settings = getSettings();
-  const lowStock = db.prepare('SELECT * FROM products WHERE stock >= 0 AND stock <= ? ORDER BY stock ASC').all(settings.lowStock);
+  const lowStock = db.prepare("SELECT * FROM products WHERE kind != 'service' AND stock >= 0 AND stock <= ? ORDER BY stock ASC").all(settings.lowStock);
   const recent = [];
   for (const s of saleRows) recent.push({ time: s.time, kind: 'in', text: '销售 ' + s.no, amt: s.payable, note: '收银 ' + s.pay_method });
   for (const e of expRows) recent.push({ time: e.time, kind: 'out', text: '出账 · ' + e.category, amt: -e.amount, note: e.note || '' });
@@ -705,7 +792,7 @@ route('GET', '/api/stats', async (req, res, params, url) => {
   const items = db.prepare('SELECT * FROM sale_items WHERE sale_id IN (SELECT id FROM sales WHERE time BETWEEN ? AND ?)').all(t0, t1);
 
   const revenue = r2(sales.reduce((a, s) => a + s.payable, 0));
-  const vipGive = r2(sales.reduce((a, s) => a + s.vipDiscount + s.pointsValue, 0));
+  const vipGive = r2(sales.reduce((a, s) => a + s.vipDiscount, 0));
   const expense = r2(exps.reduce((a, e) => a + e.amount, 0));
   const gross = r2(items.reduce((a, it) => a + (it.price - it.cost) * it.qty, 0));
 
@@ -746,7 +833,7 @@ route('GET', '/api/report', async (req, res, params, url) => {
 
   const revenue = r2(sales.reduce((a, s) => a + s.payable, 0));
   const gross = r2(items.reduce((a, it) => a + (it.price - it.cost) * it.qty, 0));
-  const vipGive = r2(sales.reduce((a, s) => a + s.vipDiscount + s.pointsValue, 0));
+  const vipGive = r2(sales.reduce((a, s) => a + s.vipDiscount, 0));
   const pointsIssued = sales.reduce((a, s) => a + s.pointsEarned, 0);
   const expense = r2(exps.reduce((a, e) => a + e.amount, 0));
   const orders = sales.length;
@@ -896,7 +983,7 @@ function buildLocalBusinessAnalysis(message, settings){
   if (intent === 'brief' || intent === 'overview'){
     const trendRange = aiTrendRange(range);
     const daily = aiDailyRevenue(trendRange, 31);
-    const lowCount = db.prepare('SELECT COUNT(*) value FROM products WHERE stock <= ?').get(settings.lowStock).value || 0;
+    const lowCount = db.prepare("SELECT COUNT(*) value FROM products WHERE kind != 'service' AND stock >= 0 AND stock <= ?").get(settings.lowStock).value || 0;
     const newMembers = db.prepare('SELECT COUNT(*) value FROM members WHERE created_at BETWEEN ? AND ?').get(range.from, range.to).value || 0;
     const comparison = aiCompareText(metrics.revenue, previous.revenue);
     const notes = [];
@@ -943,6 +1030,7 @@ function buildLocalBusinessAnalysis(message, settings){
       FROM products p
       LEFT JOIN sale_items si ON si.product_id = p.id
       LEFT JOIN sales s ON s.id = si.sale_id
+      WHERE p.kind != 'service' AND p.stock >= 0
       GROUP BY p.id ORDER BY p.stock ASC, p.name`).all(range.from, range.to);
     const rows = raw.map(p => {
       const avg = Number(p.sold) / days;
@@ -1072,7 +1160,7 @@ function buildLocalBusinessAnalysis(message, settings){
   }
 
   if (intent === 'risk'){
-    const lowRows = db.prepare('SELECT name, stock, unit FROM products WHERE stock <= ? ORDER BY stock ASC LIMIT 10').all(settings.lowStock);
+    const lowRows = db.prepare("SELECT name, stock, unit FROM products WHERE kind != 'service' AND stock >= 0 AND stock <= ? ORDER BY stock ASC LIMIT 10").all(settings.lowStock);
     const out = lowRows.filter(p => Number(p.stock) <= 0);
     const revenueRate = aiRate(metrics.revenue, previous.revenue);
     const risks = [];

@@ -121,6 +121,8 @@
   .sum-row.total{ font-size:16px; font-weight:700; color:var(--danger); border-top:1px dashed var(--line); margin-top:6px; padding-top:8px; }
   .sum-row.total .money{ font-size:20px; }
   .field-row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .material-row{ grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto; }
+  .material-row .btn{ margin-bottom:1px; }
 
   /* ---------- 弹窗 ---------- */
   .modal{ display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:50; align-items:flex-start; justify-content:center; padding:40px 16px; overflow-y:auto; }
@@ -255,10 +257,9 @@
   <div class="logo">💰 收银宝<span>收银 · 记账 · VIP</span></div>
   <div class="device-tag" id="deviceTag">设备模式：…</div>
   <nav>
-    <div class="nav-item active" data-view="analysis" onclick="switchView('analysis')"><span class="nav-icon" aria-hidden="true">📊</span><span class="nav-label">经营分析</span></div>
-    <div class="nav-item" data-view="pos" onclick="switchView('pos')"><span class="nav-icon" aria-hidden="true">🛒</span><span class="nav-label">收银台</span></div>
-    <div class="nav-item" data-view="stock" onclick="switchView('stock')"><span class="nav-icon" aria-hidden="true">📦</span><span class="nav-label">出库入库</span></div>
-    <div class="nav-item admin-only" data-view="products" onclick="switchView('products')"><span class="nav-icon" aria-hidden="true">📋</span><span class="nav-label">商品管理</span></div>
+    <div class="nav-item" data-view="analysis" onclick="switchView('analysis')"><span class="nav-icon" aria-hidden="true">📊</span><span class="nav-label">经营分析</span></div>
+    <div class="nav-item active" data-view="pos" onclick="switchView('pos')"><span class="nav-icon" aria-hidden="true">🛒</span><span class="nav-label">收银台</span></div>
+    <div class="nav-item admin-only" data-view="inventory" onclick="switchView('inventory')"><span class="nav-icon" aria-hidden="true">📦</span><span class="nav-label">库存管理</span></div>
     <div class="nav-item admin-only" data-view="members" onclick="switchView('members')"><span class="nav-icon" aria-hidden="true">👤</span><span class="nav-label">会员管理</span></div>
     <div class="nav-item admin-only" data-view="employees" onclick="switchView('employees')"><span class="nav-icon" aria-hidden="true">👷</span><span class="nav-label">员工管理</span></div>
     <div class="nav-item" data-view="expenses" onclick="switchView('expenses')"><span class="nav-icon" aria-hidden="true">💸</span><span class="nav-label">出账记账</span></div>
@@ -329,13 +330,11 @@
 
         <div class="field-row">
           <label class="field">整单折扣 %<input type="number" id="manualDiscount" value="100" min="1" max="100" step="0.1" oninput="manualDiscount=this.value;renderCart()"></label>
-          <label class="field">积分抵扣（分）<input type="number" id="pointsUse" value="0" min="0" step="1" oninput="pointsUse=this.value;renderCart()" disabled></label>
         </div>
 
         <div class="sum-row"><span>小计</span><b id="sumSubtotal">¥0.00</b></div>
         <div class="sum-row" id="sumManualRow" style="display:none"><span>整单折扣减免</span><b id="sumManual">-¥0.00</b></div>
         <div class="sum-row"><span>VIP折扣（<span id="sumRateLabel">无</span>）</span><b id="sumVip">-¥0.00</b></div>
-        <div class="sum-row"><span>积分抵扣</span><b id="sumPoints">-¥0.00</b></div>
         <div class="sum-row total"><span>应收金额</span><span class="money" id="sumPayable">¥0.00</span></div>
 
         <label class="field" style="margin-top:10px">支付方式
@@ -360,8 +359,9 @@
     </div>
   </section>
 
-  <!-- 出库入库 -->
-  <section id="view-stock" class="view">
+  <!-- 库存管理 -->
+  <section id="view-inventory" class="view">
+  <section id="view-stock" style="margin-bottom:16px">
     <div style="display:grid;grid-template-columns:1fr 1.2fr;gap:16px">
       <div class="card">
         <h3>📦 出库 / 入库</h3>
@@ -390,7 +390,7 @@
   </section>
 
   <!-- 商品管理（电脑端） -->
-  <section id="view-products" class="view">
+  <section id="view-products">
     <div class="card">
       <h3>📋 商品管理 <span class="hint">含价格编辑，仅电脑端可用</span></h3>
       <div class="toolbar">
@@ -400,10 +400,11 @@
         <button class="btn primary" onclick="productFormOpen(null)">＋ 新增商品</button>
       </div>
       <table class="tbl">
-        <thead><tr><th>商品名称</th><th>分类</th><th class="num">售价</th><th class="num">成本价</th><th class="num">库存</th><th>单位</th><th style="width:110px">操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>类型</th><th>分类</th><th class="num">售价</th><th class="num">成本价</th><th class="num">库存</th><th>单位</th><th style="width:110px">操作</th></tr></thead>
         <tbody id="prodTbody"></tbody>
       </table>
     </div>
+  </section>
   </section>
 
   <!-- 会员管理（电脑端） -->
@@ -515,7 +516,7 @@
     <div class="grid2">
       <div class="stat-card"><div class="label">订单数</div><div class="value" id="stOrders">0</div><div class="sub">单</div></div>
       <div class="stat-card"><div class="label">营业额</div><div class="value" id="stRevenue">¥0.00</div><div class="sub">实收合计</div></div>
-      <div class="stat-card"><div class="label">VIP 让利</div><div class="value" id="stVip" style="color:var(--warn)">¥0.00</div><div class="sub">VIP折扣 + 积分抵扣</div></div>
+      <div class="stat-card"><div class="label">VIP 让利</div><div class="value" id="stVip" style="color:var(--warn)">¥0.00</div><div class="sub">会员等级折扣</div></div>
       <div class="stat-card"><div class="label">出账支出</div><div class="value" id="stExpense" style="color:var(--danger)">¥0.00</div><div class="sub">出账合计</div></div>
       <div class="stat-card"><div class="label">销售毛利</div><div class="value" id="stGross">¥0.00</div><div class="sub">售价 - 成本价</div></div>
       <div class="stat-card"><div class="label">净利</div><div class="value" id="stNet" style="color:var(--ok)">¥0.00</div><div class="sub">毛利 - 支出</div></div>
@@ -589,7 +590,6 @@
         <label class="field">店铺名称<input type="text" id="setShopName"></label>
         <label class="field">收银员（小票显示）<input type="text" id="setCashier"></label>
         <label class="field">积分规则：每消费 1 元得 <input type="number" id="setPointsPerYuan" min="0" step="0.1" style="width:90px;display:inline-block;margin:0 4px"> 积分</label>
-        <label class="field">积分抵扣：每 <input type="number" id="setPointsToYuan" min="1" step="1" style="width:90px;display:inline-block;margin:0 4px"> 积分抵 1 元</label>
         <label class="field">库存预警阈值<input type="number" id="setLowStock" min="0" step="1"></label>
         <button class="btn primary" onclick="saveSettings()">保存设置</button>
       </div>
@@ -646,15 +646,26 @@
 <div class="modal" id="productModal">
   <div class="modal-box">
     <h3 id="productModalTitle">新增商品</h3>
-    <label class="field">商品名称 *<input type="text" id="pfName"></label>
+    <label class="field">项目类型<select id="pfKind" onchange="updateProductKind()">
+      <option value="goods">实物商品（销售并扣库存）</option>
+      <option value="service">服务项目（可配置耗材）</option>
+      <option value="supply">耗材（只用于库存和服务）</option>
+    </select></label>
+    <label class="field">名称 *<input type="text" id="pfName"></label>
     <label class="field">分类<input type="text" id="pfCat" list="catList" placeholder="如：饮料、零食、日用品"></label>
     <div class="field-row">
-      <label class="field">售价（元）*<input type="number" id="pfPrice" min="0" step="0.01"></label>
-      <label class="field">成本价（元）<input type="number" id="pfCost" min="0" step="0.01"></label>
+      <label class="field" id="pfPriceField">售价（元）*<input type="number" id="pfPrice" min="0" step="0.01"></label>
+      <label class="field"><span id="pfCostLabel">成本价（元）</span><input type="number" id="pfCost" min="0" step="0.01"></label>
     </div>
     <div class="field-row">
-      <label class="field">库存（-1 表示不限）<input type="number" id="pfStock" step="1"></label>
+      <label class="field" id="pfStockField">库存（-1 表示不限）<input type="number" id="pfStock" step="0.001"></label>
       <label class="field">单位<input type="text" id="pfUnit" placeholder="瓶/件/斤"></label>
+    </div>
+    <div id="pfMaterialsPanel" style="display:none">
+      <div style="font-weight:600;margin:8px 0">每次服务消耗的耗材</div>
+      <div id="pfMaterials"></div>
+      <button class="btn small" onclick="addMaterialRow()">＋ 添加耗材</button>
+      <div class="hint" style="margin-top:6px">不添加耗材时，服务结账不会扣减库存。</div>
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('productModal')">取消</button>

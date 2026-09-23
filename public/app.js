@@ -92,7 +92,7 @@ function applyDeviceMode(){
 /* ---------- 视图切换 ---------- */
 const PAGE_TITLES = {
   analysis: '📊 经营分析',
-  home: '📊 今日概览', pos: '🛒 收银台', stock: '📦 出库入库', products: '📋 商品管理',
+  home: '📊 今日概览', pos: '🛒 收银台', inventory: '📦 库存管理',
   members: '👤 会员管理', employees: '👷 员工管理', expenses: '💸 出账记账', ledger: '📒 流水账本', stats: '📈 统计分析', report: '📑 报表中心', chat: '🤖 AI 助手', settings: '⚙️ 系统设置'
 };
 const MOBILE_VIEWS = new Set(['pos', 'expenses']);
@@ -110,7 +110,7 @@ async function switchView(name){
   $('#pageTitle').textContent = PAGE_TITLES[name] || '';
   const renders = {
     analysis: renderAnalysis,
-    home: renderHome, pos: renderPos, stock: renderStock, products: renderProducts, members: renderMembers,
+    home: renderHome, pos: renderPos, inventory: renderInventory, members: renderMembers,
     employees: renderEmployees, expenses: renderExpenses, ledger: renderLedger, stats: renderStats, report: renderReport, chat: renderChat, settings: renderSettings
   };
   if (renders[name]) await renders[name]();
@@ -169,7 +169,6 @@ async function renderHome(){
 let prodFilter = { kw: '', cat: '全部' };
 let cart = [];
 let cartMemberId = '';
-let pointsUse = 0;
 let manualDiscount = 100;
 let payMethod = '微信';
 let cashReceived = '';
@@ -190,31 +189,40 @@ function renderPos(){
 }
 
 function renderProductGrid(){
-  const cats = ['全部', ...new Set(D.products.map(p => p.category))];
+  const saleable = D.products.filter(p => p.kind !== 'supply');
+  const cats = ['全部', ...new Set(saleable.map(p => p.category))];
   $('#catChips').innerHTML = cats.map(c =>
     `<div class="chip ${prodFilter.cat === c ? 'active' : ''}" onclick="prodFilter.cat=${JSON.stringify(c)};renderProductGrid()">${esc(c)}</div>`).join('');
 
   const kw = prodFilter.kw.trim().toLowerCase();
-  const list = D.products.filter(p =>
+  const list = saleable.filter(p =>
     (prodFilter.cat === '全部' || p.category === prodFilter.cat) &&
     (!kw || p.name.toLowerCase().includes(kw)));
 
   $('#posGrid').innerHTML = list.length ? list.map(p => {
-    const out = p.stock === 0;
-    const low = p.stock > 0 && p.stock <= D.settings.lowStock;
+    const service = p.kind === 'service';
+    const out = !service && p.stock === 0;
+    const low = !service && p.stock > 0 && p.stock <= D.settings.lowStock;
+    const materials = (D.serviceMaterials || []).filter(m => m.serviceId === p.id);
+    const detail = service ? (materials.length ? '服务 · 消耗 ' + materials.map(m => {
+      const material = D.products.find(x => x.id === m.materialId);
+      return material ? material.name + ' ' + m.qty + (material.unit || '') : '';
+    }).filter(Boolean).join('、') : '服务 · 不消耗耗材') : (p.stock < 0 ? '不限库存' : '库存 ' + p.stock) + ' ' + (p.unit || '');
     return `<div class="pcard ${out ? 'out' : ''} ${low ? 'low' : ''}" ${out ? '' : `onclick="addToCart('${p.id}')"`} title="点击加入购物车">
       <div class="pname">${esc(p.name)}</div>
       <div class="pprice">${money(p.price)}</div>
-      <div class="pstock">${p.stock < 0 ? '不限库存' : '库存 ' + p.stock} ${esc(p.unit || '')}</div>
+      <div class="pstock">${esc(detail)}</div>
     </div>`;
   }).join('') : '<div class="empty" style="grid-column:1/-1">没有找到商品，请到电脑端「商品管理」添加</div>';
 }
 
 function addToCart(pid){
-  const p = D.products.find(x => x.id === pid);
+  const productId = Number(pid);
+  const p = D.products.find(x => x.id === productId);
   if (!p) return;
+  if (p.kind === 'supply') return;
   if (p.stock === 0){ alert(`「${p.name}」已售罄`); return; }
-  const item = cart.find(c => c.productId === pid);
+  const item = cart.find(c => c.productId === productId);
   if (item){
     if (p.stock >= 0 && item.qty + 1 > p.stock){ alert(`「${p.name}」库存不足（剩余 ${p.stock}）`); return; }
     item.qty++;
@@ -224,20 +232,24 @@ function addToCart(pid){
   renderCart();
 }
 function cartQty(pid, d){
-  const item = cart.find(c => c.productId === pid);
+  const productId = Number(pid);
+  const item = cart.find(c => c.productId === productId);
   if (!item) return;
-  const p = D.products.find(x => x.id === pid);
+  const p = D.products.find(x => x.id === productId);
   item.qty += d;
-  if (item.qty <= 0){ cart = cart.filter(c => c.productId !== pid); }
+  if (item.qty <= 0){ cart = cart.filter(c => c.productId !== productId); }
   else if (p && p.stock >= 0 && item.qty > p.stock){ alert(`「${p.name}」库存不足`); item.qty = p.stock; }
   renderCart();
 }
-function removeFromCart(pid){ cart = cart.filter(c => c.productId !== pid); renderCart(); }
+function removeFromCart(pid){
+  const productId = Number(pid);
+  cart = cart.filter(c => c.productId !== productId);
+  renderCart();
+}
 function clearCart(){ if (cart.length && !confirm('确定清空购物车？')) return; cart = []; renderCart(); }
 
 function onMemberChange(){
   cartMemberId = $('#memberSelect').value;
-  pointsUse = 0;
   cashReceived = '';
   renderCart();
 }
@@ -257,15 +269,9 @@ function calcCart(){
   const rate = member ? levelRate(member.levelId) : 1;
   const vipDiscount = round2(afterManual - afterManual * rate);
   const afterVip = round2(afterManual * rate);
-  let pu = Math.max(0, Math.floor(parseFloat(pointsUse) || 0));
-  if (member) pu = Math.min(pu, member.points);
-  const maxPointsValue = round2(afterVip * 0.5);
-  const maxPoints = Math.floor(maxPointsValue * D.settings.pointsToYuan);
-  pu = Math.min(pu, maxPoints);
-  const pointsValue = round2(pu / D.settings.pointsToYuan);
-  const payable = Math.max(0, round2(afterVip - pointsValue));
+  const payable = afterVip;
   const pointsEarned = Math.floor(payable * D.settings.pointsPerYuan);
-  return { subtotal, manualRate, manualDiscountAmt, vipRate: rate, vipDiscount, pointsUsed: pu, pointsValue, payable, pointsEarned };
+  return { subtotal, manualRate, manualDiscountAmt, vipRate: rate, vipDiscount, payable, pointsEarned };
 }
 
 function renderCart(){
@@ -275,12 +281,9 @@ function renderCart(){
 
   const member = cartMemberId ? D.members.find(m => m.id === cartMemberId) : null;
   $('#memberInfo').innerHTML = member
-    ? `会员：${esc(member.name)}　等级：${esc(levelName(member.levelId))}（${(levelRate(member.levelId) * 100).toFixed(0)}折）　可用积分：${member.points}`
+    ? `会员：${esc(member.name)}　等级：${esc(levelName(member.levelId))}（${(levelRate(member.levelId) * 100).toFixed(0)}折）　积分余额：${member.points}`
     : '未选择会员';
 
-  const puInput = $('#pointsUse');
-  puInput.disabled = !member;
-  if (!member){ pointsUse = 0; puInput.value = 0; }
   $('#manualDiscount').value = manualDiscount;
 
   $('#cartList').innerHTML = cart.length ? cart.map(c =>
@@ -296,15 +299,12 @@ function renderCart(){
     </div>`).join('') : '<div class="empty">购物车为空，点击左侧商品加入</div>';
 
   const s = calcCart();
-  pointsUse = s.pointsUsed;
-  puInput.value = pointsUse;
 
   $('#sumSubtotal').textContent = money(s.subtotal);
   $('#sumManualRow').style.display = s.manualDiscountAmt > 0.001 ? 'flex' : 'none';
   $('#sumManual').textContent = '-' + money(s.manualDiscountAmt);
   $('#sumRateLabel').textContent = member ? levelName(member.levelId) + ' ' + (s.vipRate * 100).toFixed(0) + '折' : '无';
   $('#sumVip').textContent = '-' + money(s.vipDiscount);
-  $('#sumPoints').textContent = '-' + money(s.pointsValue);
   $('#sumPayable').textContent = money(s.payable);
 
   $('#cashRow').style.display = payMethod === '现金' ? 'block' : 'none';
@@ -324,7 +324,6 @@ async function settle(){
       body: {
         items: cart.map(c => ({ productId: c.productId, qty: c.qty })),
         memberId: cartMemberId || null,
-        pointsUse,
         manualDiscount,
         payMethod,
         cashReceived: parseFloat(cashReceived) || null,
@@ -334,7 +333,7 @@ async function settle(){
     });
     await refresh();
     showReceipt(sale);
-    cart = []; cartMemberId = ''; pointsUse = 0; manualDiscount = 100; cashReceived = ''; payMethod = '微信';
+    cart = []; cartMemberId = ''; manualDiscount = 100; cashReceived = ''; payMethod = '微信';
     renderPos();
   } catch (e){
     alert('结算失败：' + e.message);
@@ -355,7 +354,6 @@ function showReceipt(sale){
       <div class="r-line"><span>小计</span><span>${money(sale.subtotal)}</span></div>
       ${sale.manualDiscountAmt > 0.001 ? `<div class="r-line"><span>整单折扣</span><span>-${money(sale.manualDiscountAmt)}</span></div>` : ''}
       ${sale.memberName ? `<div class="r-line"><span>${esc(sale.memberName)}（${esc(sale.memberLevel)}）</span><span>-${money(sale.vipDiscount)}</span></div>` : ''}
-      ${sale.pointsValue > 0 ? `<div class="r-line"><span>积分抵扣 ${sale.pointsUsed} 分</span><span>-${money(sale.pointsValue)}</span></div>` : ''}
       <div class="r-line r-tot"><span>实收</span><span>${money(sale.payable)}</span></div>
       <div class="r-line"><span>支付方式</span><span>${esc(sale.payMethod)}</span></div>
       ${sale.payMethod === '现金' ? `<div class="r-line"><span>现金 ${money(sale.cashReceived)}　找零</span><span>${money(sale.change)}</span></div>` : ''}
@@ -373,9 +371,13 @@ function printReceipt(){
  * 出库入库
  * ============================================================ */
 function renderStock(){
-  $('#stockProduct').innerHTML = D.products.map(p =>
+  $('#stockProduct').innerHTML = D.products.filter(p => p.kind !== 'service').map(p =>
     `<option value="${p.id}">${esc(p.name)}（当前库存 ${p.stock < 0 ? '不限' : p.stock} ${esc(p.unit || '')}）</option>`).join('');
   renderStockMoves();
+}
+function renderInventory(){
+  renderStock();
+  renderProducts();
 }
 async function renderStockMoves(){
   const moves = await api('/stock-moves?limit=30');
@@ -399,7 +401,7 @@ async function submitStock(){
     await refresh();
     $('#stockQty').value = '';
     $('#stockNote').value = '';
-    renderStock();
+    renderInventory();
     alert('操作成功，当前库存：' + r.newStock);
   } catch (e){ alert('操作失败：' + e.message); }
 }
@@ -409,8 +411,8 @@ async function submitStock(){
  * ============================================================ */
 let editingProductId = null;
 function productFormOpen(id){
-  editingProductId = id || null;
-  const p = id ? D.products.find(x => x.id === id) : null;
+  editingProductId = id ? Number(id) : null;
+  const p = editingProductId ? D.products.find(x => x.id === editingProductId) : null;
   $('#productModalTitle').textContent = p ? '编辑商品' : '新增商品';
   $('#pfName').value = p ? p.name : '';
   $('#pfCat').value = p ? p.category : '';
@@ -418,34 +420,66 @@ function productFormOpen(id){
   $('#pfCost').value = p ? p.cost : '';
   $('#pfStock').value = p ? p.stock : 100;
   $('#pfUnit').value = p ? p.unit : '';
+  $('#pfKind').value = p ? (p.kind || 'goods') : 'goods';
+  $('#pfMaterials').innerHTML = '';
+  if (p) (D.serviceMaterials || []).filter(m => m.serviceId === p.id).forEach(m => addMaterialRow(m.materialId, m.qty));
+  updateProductKind();
   openModal('productModal');
+}
+function updateProductKind(){
+  const service = $('#pfKind').value === 'service';
+  const supply = $('#pfKind').value === 'supply';
+  $('#pfStockField').style.display = service ? 'none' : '';
+  $('#pfPriceField').style.display = supply ? 'none' : '';
+  $('#pfCostLabel').textContent = service ? '服务基础成本（元，不含耗材）' : '成本价（元）';
+  $('#pfMaterialsPanel').style.display = service ? '' : 'none';
+}
+function addMaterialRow(materialId, qty){
+  const options = D.products.filter(p => p.kind !== 'service' && p.id !== editingProductId)
+    .map(p => `<option value="${p.id}" ${p.id === Number(materialId) ? 'selected' : ''}>${esc(p.name)}（库存 ${p.stock < 0 ? '不限' : p.stock} ${esc(p.unit || '')}）</option>`).join('');
+  if (!options){ alert('请先新增实物商品或耗材'); return; }
+  const row = document.createElement('div');
+  row.className = 'field-row material-row';
+  row.style.cssText = 'align-items:end;margin:8px 0';
+  row.innerHTML = `<label class="field">耗材<select class="material-id">${options}</select></label>
+    <label class="field">每次用量<input class="material-qty" type="number" min="0.001" step="0.001" value="${qty || 1}"></label>
+    <button class="btn small danger" onclick="this.parentElement.remove()">移除</button>`;
+  $('#pfMaterials').appendChild(row);
 }
 async function saveProduct(){
   const name = $('#pfName').value.trim();
-  const price = parseFloat($('#pfPrice').value);
+  const kind = $('#pfKind').value;
+  const price = kind === 'supply' ? 0 : parseFloat($('#pfPrice').value);
   if (!name){ alert('请输入商品名称'); return; }
   if (isNaN(price) || price < 0){ alert('请输入正确的售价'); return; }
+  const materials = $$('#pfMaterials .material-row').map(row => ({
+    materialId: Number(row.querySelector('.material-id').value),
+    qty: Number(row.querySelector('.material-qty').value)
+  }));
+  if (kind === 'service' && materials.some(m => !Number.isFinite(m.qty) || m.qty <= 0)){ alert('请输入正确的耗材用量'); return; }
   const body = {
     name,
+    kind,
     category: $('#pfCat').value.trim() || '未分类',
     price: round2(price),
     cost: round2(parseFloat($('#pfCost').value) || 0),
-    stock: Math.round(parseFloat($('#pfStock').value) || 0),
-    unit: $('#pfUnit').value.trim()
+    stock: kind === 'service' ? -1 : parseFloat($('#pfStock').value),
+    unit: $('#pfUnit').value.trim(),
+    materials: kind === 'service' ? materials : []
   };
   try {
     if (editingProductId) await api('/products/' + editingProductId, { method: 'PUT', body });
     else await api('/products', { method: 'POST', body });
-    await refresh(); closeModal('productModal'); renderProducts();
+    await refresh(); closeModal('productModal'); renderInventory();
   } catch (e){ alert('保存失败：' + e.message); }
 }
 async function delProduct(id){
-  const p = D.products.find(x => x.id === id);
+  const p = D.products.find(x => x.id === Number(id));
   if (!p) return;
   if (!confirm(`确定删除商品「${p.name}」？历史销售记录不受影响。`)) return;
   try {
     await api('/products/' + id, { method: 'DELETE' });
-    await refresh(); renderProducts();
+    await refresh(); renderInventory();
   } catch (e){ alert('删除失败：' + e.message); }
 }
 function renderProducts(){
@@ -460,15 +494,16 @@ function renderProducts(){
 
   $('#prodTbody').innerHTML = list.length ? list.map(p => `
     <tr>
-      <td><b>${esc(p.name)}</b></td>
+      <td><b>${esc(p.name)}</b>${p.kind === 'service' ? '<div class="hint">' + ((D.serviceMaterials || []).filter(m => m.serviceId === p.id).map(m => { const x = D.products.find(y => y.id === m.materialId); return x ? esc(x.name) + ' ' + m.qty + esc(x.unit || '') : ''; }).filter(Boolean).join('、') || '无耗材') + '</div>' : ''}</td>
+      <td><span class="badge b-gray">${p.kind === 'service' ? '服务' : p.kind === 'supply' ? '耗材' : '商品'}</span></td>
       <td><span class="badge b-gray">${esc(p.category)}</span></td>
       <td class="num">${money(p.price)}</td>
       <td class="num" style="color:var(--muted)">${money(p.cost)}</td>
-      <td class="num ${p.stock >= 0 && p.stock <= D.settings.lowStock ? 'b-red' : ''}">${p.stock < 0 ? '不限' : p.stock}</td>
+      <td class="num ${p.kind !== 'service' && p.stock >= 0 && p.stock <= D.settings.lowStock ? 'b-red' : ''}">${p.kind === 'service' ? '—' : p.stock < 0 ? '不限' : p.stock}</td>
       <td>${esc(p.unit || '')}</td>
       <td><button class="btn small" onclick="productFormOpen('${p.id}')">编辑</button>
           <button class="btn small danger" onclick="delProduct('${p.id}')">删除</button></td>
-    </tr>`).join('') : '<tr><td colspan="7" class="empty">暂无商品</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无项目</td></tr>';
 }
 
 /* ============================================================
@@ -822,7 +857,6 @@ function renderSettings(){
   $('#setShopName').value = D.settings.shopName;
   $('#setCashier').value = D.settings.cashier;
   $('#setPointsPerYuan').value = D.settings.pointsPerYuan;
-  $('#setPointsToYuan').value = D.settings.pointsToYuan;
   $('#setLowStock').value = D.settings.lowStock;
   $('#setAiProvider').value = D.settings.aiProvider || 'demo';
   $('#setAiBaseUrl').value = D.settings.aiBaseUrl || 'https://api.deepseek.com';
@@ -834,7 +868,6 @@ function collectSettings(){
     shopName: $('#setShopName').value.trim() || '收银宝便利店',
     cashier: $('#setCashier').value.trim() || '收银员',
     pointsPerYuan: parseFloat($('#setPointsPerYuan').value) || 0,
-    pointsToYuan: parseInt($('#setPointsToYuan').value, 10) || 100,
     lowStock: parseInt($('#setLowStock').value, 10) || 10,
     aiProvider: $('#setAiProvider').value,
     aiBaseUrl: $('#setAiBaseUrl').value.trim(),
@@ -1162,7 +1195,7 @@ async function sendChat(){
       showEmployeeLogin();
       return;
     }
-    await switchView(DEVICE === 'mobile' ? 'pos' : 'analysis');
+    await switchView('pos');
   } catch (e){
     document.body.innerHTML = `<div style="padding:60px;text-align:center;font-family:sans-serif">
       <h2>⚠️ 无法连接服务器</h2>
